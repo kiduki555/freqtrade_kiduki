@@ -1,0 +1,18 @@
+# user_data/TFT_PPO_Training/configs/wandb_config.yml
+wandb:
+  project: "TFT_PPO_Autotrader"
+  entity: "quant-research-team"
+  notes: "5y TFT pretrain + 6m PPO fine-tune with Optuna tuning"
+  tags:
+    - "ppo"
+    - "tft"
+    - "reinforcement-learning"
+    - "freqtrade"
+  save_model: true
+  log_interval: 10000
+  monitor_metrics:
+    - sharpe
+    - mdd
+    - win_rate
+    - total_reward
+  mode: "online"   # (offline 가능)

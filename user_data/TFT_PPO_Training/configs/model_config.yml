@@ -1,0 +1,33 @@
+seed: 42
+device: "cuda"
+
+data:
+  path: "user_data/data/BTC_USDT-1h.csv"
+  window: 72
+  lookback_days: 1825   # 5년
+  finetune_days: 180    # 6개월
+
+tft:
+  hidden_size: 64
+  attention_heads: 4
+  dropout: 0.1
+  learning_rate: 0.0001
+  epochs: 10
+  batch_size: 64
+
+ppo:
+  learning_rate: 0.00003
+  gamma: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  batch_size: 512
+  n_steps: 2048
+  timesteps: 2000000
+
+optuna:
+  trials: 15
+  direction: maximize
+
+logging:
+  wandb_project: "TFT_PPO_Trader"
+  wandb_entity: "quant-research-team"
