@@ -1,4 +1,4 @@
-# user_data/TFT_PPO_Modules/checkpoint.py
+# user_data/TFT_PPO_modules/checkpoint.py
 import os
 import torch
 import json

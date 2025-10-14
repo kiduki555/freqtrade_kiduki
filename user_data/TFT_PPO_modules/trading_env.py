@@ -1,7 +1,7 @@
 import gymnasium as gym
 import numpy as np
 import torch
-from TFT_PPO_Modules.reward_function import custom_reward
+from TFT_PPO_modules.reward_function import custom_reward
 
 
 class TradingEnv(gym.Env):
@@ -51,20 +51,22 @@ class TradingEnv(gym.Env):
 
         # === Spaces (Gymnasium style) ===
         self.action_space = gym.spaces.Discrete(3)  # 0=Hold, 1=Buy(Long), 2=Sell(Short)
+        
+        # === obs_dim을 데이터에서 동적으로 계산 ===
+        self.obs_dim = self.window * len(self.features)
         self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(64,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32
         )
 
     # -----------------------------
     # State extraction
     # -----------------------------
     def _get_state(self):
-        """Compute state representation via TFT encoder."""
-        window_data = self.df[self.features].iloc[self.current_step - self.window : self.current_step]
-        x = torch.tensor(window_data.values, dtype=torch.float32, device=self.device).unsqueeze(0)
-        with torch.no_grad():
-            state = self.tft(x)
-        return state.squeeze().cpu().numpy().astype(np.float32)
+        """Compute state representation - flatten window features."""
+        # 최근 window를 꺼내 1D로 평탄화
+        window_df = self.df[self.features].iloc[self.current_step - self.window : self.current_step]
+        x = window_df.values.astype(np.float32).reshape(-1)   # (window*features,)
+        return x
 
     # -----------------------------
     # Step

@@ -2,19 +2,24 @@
 from __future__ import annotations
 
 import os
+import sys
 import yaml
 import torch
 import numpy as np
 import pandas as pd
 from datetime import datetime
 
+# Add parent directories to Python path
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from TFT_PPO_Modules.feature_pipeline import FeaturePipeline
-from TFT_PPO_Modules.trading_env import TradingEnv
-from TFT_PPO_Modules.checkpoint import ModelCheckpoint
-from TFT_PPO_Modules.performance_metrics import performance_metrics
+from TFT_PPO_modules.feature_pipeline import FeaturePipeline
+from TFT_PPO_modules.trading_env import TradingEnv
+from TFT_PPO_modules.checkpoint import ModelCheckpoint
+from TFT_PPO_modules.performance_metrics import performance_metrics
 from TFT_PPO_Training.scripts.utils import setup_device, set_seed, ensure_dir
 from TFT_PPO_Training.scripts.optuna_tuning import tune_ppo
 
@@ -27,7 +32,7 @@ from torch.utils.data import DataLoader
 # 1) Load Config & Setup
 # ============================
 CONFIG_PATH = "user_data/TFT_PPO_Training/configs/model_config.yml"
-with open(CONFIG_PATH, "r") as f:
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
 device = setup_device(verbose=True)  # text-only logs
@@ -40,7 +45,7 @@ ensure_dir("user_data/models/best", verbose=True)
 # 2) Data Preparation
 # ============================
 print("Loading data...")
-df = pd.read_csv(config["data"]["path"])
+df = pd.read_feather(config["data"]["path"])
 df["date"] = pd.to_datetime(df["date"])
 df = df.sort_values("date").reset_index(drop=True)
 
@@ -100,14 +105,22 @@ optimizer = torch.optim.Adam(tft.parameters(), lr=float(config["tft"]["learning_
 for epoch in range(int(config["tft"]["epochs"])):
     total_loss = 0.0
     for batch in train_loader:
-        # pytorch_forecasting returns a dict-like batch
+        # pytorch_forecasting returns a tuple (x, y)
         x, y = batch
+        # Move batch data to device
+        x = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in x.items()}
+        if isinstance(y, (tuple, list)):
+            target = y[0].to(device) if isinstance(y[0], torch.Tensor) else y[0]
+        else:
+            target = y.to(device) if isinstance(y, torch.Tensor) else y
+        
         optimizer.zero_grad()
-        # y can be tuple(target, weight) depending on dataset; take first item if tuple
-        target = y[0] if isinstance(y, (tuple, list)) else y
-        out = tft(x.to(device))
-        # out shape [B, pred_len], target shape [B, pred_len]
-        loss = torch.mean(torch.abs(out - target.to(device)))
+        # Pass x dict to TFT
+        out = tft(x)
+        # TFT returns Output object, extract prediction
+        prediction = out.prediction if hasattr(out, 'prediction') else out
+        # Calculate loss
+        loss = torch.mean(torch.abs(prediction - target))
         loss.backward()
         optimizer.step()
         total_loss += float(loss.item())
@@ -127,12 +140,12 @@ def make_env():
     # TradingEnv is gymnasium-compatible; SB3 DummyVecEnv expects a callable returning an Env
     return TradingEnv(df_ppo, tft_model=tft.eval(), features=fp.features)
 
-# Optuna tuning (returns best_params). Our tune_ppo expects env_fn, not env instance
-best_params = tune_ppo(make_env, config)
+# Optuna 튜닝
+best_params = tune_ppo(make_env, config, optuna_cfg_path="user_data/TFT_PPO_Training/configs/optuna_config.yml")
 
-# Build vectorized env with best hyperparameters
+# 최종 학습(선택): 튜닝된 파라미터 + timesteps 크게
 env = DummyVecEnv([make_env])
-ppo = PPO("MlpPolicy", env, **best_params, verbose=1, seed=config.get("seed", 42))
+ppo = PPO("MlpPolicy", env, **best_params, seed=config.get("seed", 42), device="cpu", verbose=1)
 
 checkpoint = ModelCheckpoint(save_dir="user_data/models/best")
 

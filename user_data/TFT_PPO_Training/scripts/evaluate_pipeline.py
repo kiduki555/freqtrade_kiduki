@@ -5,7 +5,7 @@ import numpy as np
 from typing import Optional, Callable, Union
 
 from stable_baselines3 import PPO
-from TFT_PPO_Modules.performance_metrics import performance_metrics
+from TFT_PPO_modules.performance_metrics import performance_metrics
 
 
 def evaluate_pipeline(

@@ -3,35 +3,21 @@ optuna:
   study_name: "PPO_TFT_Optimization"
   direction: "maximize"
   storage: "sqlite:///user_data/TFT_PPO_Training/logs/optuna_studies/ppo_tft.db"
-  n_trials: 20
-  timeout: 14400      # 초 단위 (4시간)
-
+  n_trials: 40             # 더 많이
+  timeout: 21600           # 6시간 예시
+  n_jobs: 1                # 병렬 가능 환경이면 >1
+  eval_freq: 50000         # 중간평가 주기(타임스텝)
+  eval_episodes: 2         # 에피소드 수
   sampler:
     type: "TPESampler"
     seed: 42
-
   pruner:
     type: "MedianPruner"
     n_startup_trials: 5
-    n_warmup_steps: 3
-
+    n_warmup_steps: 2
   search_space:
-    learning_rate:
-      type: "loguniform"
-      low: 1e-6
-      high: 1e-3
-    gamma:
-      type: "uniform"
-      low: 0.90
-      high: 0.99
-    clip_range:
-      type: "uniform"
-      low: 0.1
-      high: 0.4
-    ent_coef:
-      type: "uniform"
-      low: 0.0
-      high: 0.02
-    batch_size:
-      type: "categorical"
-      choices: [128, 256, 512]
+    learning_rate: { type: "loguniform", low: 1e-6, high: 1e-3 }
+    gamma:         { type: "uniform",    low: 0.90, high: 0.99 }
+    clip_range:    { type: "uniform",    low: 0.1,  high: 0.4 }
+    ent_coef:      { type: "uniform",    low: 0.0,  high: 0.02 }
+    batch_size:    { type: "categorical", choices: [128, 256, 512] }

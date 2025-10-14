@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from freqtrade.strategy import IStrategy, IntParameter
-from TFT_PPO_Modules.feature_pipeline import FeaturePipeline
-from TFT_PPO_Modules.ppo_agent import PPOAgent
-from TFT_PPO_Modules.tft_encoder import TFTEncoder
+from TFT_PPO_modules.feature_pipeline import FeaturePipeline
+from TFT_PPO_modules.ppo_agent import PPOAgent
+from TFT_PPO_modules.tft_encoder import TFTEncoder
 
 import pandas as pd
 import numpy as np

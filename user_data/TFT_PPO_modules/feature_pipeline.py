@@ -62,14 +62,8 @@ class FeaturePipeline:
         bb = ta.volatility.BollingerBands(close=df['close'], window=20, window_dev=2)
         df['bollinger_width'] = (bb.bollinger_hband() - bb.bollinger_lband()) / df['close']  # Normalized bandwidth
 
-        # === SuperTrend (Adaptive volatility-based trend tracker) ===
-        try:
-            st = ta.trend.SuperTrend(high=df['high'], low=df['low'], close=df['close'],
-                                     window=10, multiplier=3.0)
-            df['supertrend'] = st.super_trend()
-        except Exception:
-            # For environments with older `ta` versions
-            df['supertrend'] = np.nan
+        # === SuperTrend (Custom implementation) ===
+        df['supertrend'] = self._compute_supertrend(df, period=10, multiplier=3.0)
 
         # === Statistical volatility & distribution shape ===
         logret = np.log(df['close']).diff()
@@ -98,8 +92,53 @@ class FeaturePipeline:
         df['candle_body_ratio'] = (df['close'] - df['open']).abs() / (df['high'] - df['low'] + 1e-9)
 
         # === Data hygiene ===
-        # Replace non-finite values and drop incomplete rows to ensure model stability
+        # Replace non-finite values and fill NaN with forward fill + backward fill
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        
+        # Forward fill then backward fill to handle NaN values
+        df = df.ffill().bfill()
+        
+        # Only drop rows if still NaN after filling
         df = df.dropna().reset_index(drop=True)
 
         return df
+
+    def _compute_supertrend(self, df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> pd.Series:
+        """
+        Custom SuperTrend indicator (for older versions of `ta` that lack SuperTrendIndicator)
+        """
+        hl2 = (df['high'] + df['low']) / 2
+        atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=period).average_true_range()
+
+        upperband = hl2 + multiplier * atr
+        lowerband = hl2 - multiplier * atr
+
+        final_upperband = upperband.copy()
+        final_lowerband = lowerband.copy()
+
+        for i in range(1, len(df)):
+            if df['close'].iloc[i - 1] <= final_upperband.iloc[i - 1]:
+                final_upperband.iloc[i] = min(upperband.iloc[i], final_upperband.iloc[i - 1])
+            else:
+                final_upperband.iloc[i] = upperband.iloc[i]
+
+            if df['close'].iloc[i - 1] >= final_lowerband.iloc[i - 1]:
+                final_lowerband.iloc[i] = max(lowerband.iloc[i], final_lowerband.iloc[i - 1])
+            else:
+                final_lowerband.iloc[i] = lowerband.iloc[i]
+
+        supertrend = pd.Series(np.nan, index=df.index)
+        in_uptrend = True
+
+        for i in range(1, len(df)):
+            if df['close'].iloc[i] > final_upperband.iloc[i - 1]:
+                in_uptrend = True
+            elif df['close'].iloc[i] < final_lowerband.iloc[i - 1]:
+                in_uptrend = False
+
+            if in_uptrend:
+                supertrend.iloc[i] = final_lowerband.iloc[i]
+            else:
+                supertrend.iloc[i] = final_upperband.iloc[i]
+
+        return supertrend

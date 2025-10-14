@@ -2,18 +2,19 @@ seed: 42
 device: "cuda"
 
 data:
-  path: "user_data/data/BTC_USDT-1h.csv"
+  path: "user_data/data/binance/BTC_USDT-1h.feather"
   window: 72
-  lookback_days: 1825   # 5년
-  finetune_days: 180    # 6개월
+  lookback_days: 1825
+  finetune_days: 180
 
 tft:
   hidden_size: 64
   attention_heads: 4
   dropout: 0.1
   learning_rate: 0.0001
-  epochs: 10
+  epochs: 42
   batch_size: 64
+  encoder_length: 72
 
 ppo:
   learning_rate: 0.00003
@@ -26,6 +27,7 @@ ppo:
 
 optuna:
   trials: 15
+  timesteps: 200000
   direction: maximize
 
 logging:
