@@ -12,9 +12,17 @@ tft:
   attention_heads: 4
   dropout: 0.1
   learning_rate: 0.0001
-  epochs: 42
+  max_epochs: 100
   batch_size: 64
   encoder_length: 72
+  early_stopping:
+    patience: 5
+    min_delta: 1e-6
+  scheduler:
+    factor: 0.5
+    patience: 2
+  grad_clip: 0.5
+  train_split: 0.85
 
 ppo:
   learning_rate: 0.00003

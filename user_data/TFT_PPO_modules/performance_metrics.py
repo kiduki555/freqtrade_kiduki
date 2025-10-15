@@ -41,7 +41,8 @@ def performance_metrics(
         return {k: np.nan for k in ["sharpe", "sortino", "calmar", "mdd", "win_rate", "skew", "kurtosis", "avg_return", "volatility"]}
 
     # --- Annualization scaling ---
-    ann_factor = {"daily": 252, "hourly": 24 * 252, "minute": 24 * 60 * 252}.get(freq, 252)
+    # 1시간봉 크립토는 24×365≈8760시간이므로 연율화는 sqrt(8760)가 더 타당
+    ann_factor = {"daily": 252, "hourly": 24 * 365, "minute": 24 * 60 * 365}.get(freq, 252)
 
     # --- Mean & volatility ---
     mean_ret = np.mean(returns)

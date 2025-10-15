@@ -1,0 +1,21 @@
+ent_coef: 0.02
+gamma: 0.95
+clip_range: 0.2
+learning_rate: 3e-4
+batch_size: 64
+n_epochs: 10
+policy_kwargs:
+  net_arch: [256, 256, 128]
+  trade_cost_multiplier: 2.0
+  flat_hold_bonus: 1e-6
+  action_cooldown_steps: 2
+  reward_scale: 100.0
+  time_penalty: -1e-7
+normalize_observations: true
+normalize_rewards: true
+
+target_kl: 0.01
+max_grad_norm: 0.5
+gae_lambda: 0.95
+action_masking: true
+mask_invalid_actions: true
