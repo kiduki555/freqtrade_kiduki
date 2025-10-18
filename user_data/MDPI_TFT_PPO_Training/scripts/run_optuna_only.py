@@ -29,8 +29,38 @@ warnings.filterwarnings("ignore", message=".*ROC AUC score is not defined.*")
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 
+# --- Anti-zero wrapper ---
+import gymnasium as gym
+import numpy as np
+
+class ActionThresholdHoldPenalty(gym.Wrapper):
+    def __init__(self, env, min_action_threshold=0.05, hold_penalty_bps=0.2):
+        super().__init__(env)
+        self.min_action_threshold = float(min_action_threshold)
+        self.hold_penalty = float(hold_penalty_bps) / 1e4  # bps→ratio
+
+    def step(self, action):
+        # action 라운딩(너무 작으면 0으로)
+        a = np.array(action, dtype=np.float32)
+        if np.isscalar(a):
+            a = np.array([a], dtype=np.float32)
+        a = np.where(np.abs(a) < self.min_action_threshold, 0.0, a)
+        obs, reward, terminated, truncated, info = self.env.step(a)
+
+        # 포지션 거의 0일 때 아주 소액 페널티(기회비용)
+        # env에 current_position/position 같은 속성이 있으면 그걸 사용
+        pos = 0.0
+        for key in ("current_position", "position", "pos"):
+            if hasattr(self.env, key):
+                pos = float(getattr(self.env, key))
+                break
+        if abs(pos) < 1e-6:
+            reward = float(reward) - self.hold_penalty
+
+        return obs, reward, terminated, truncated, info
+
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from TFT_PPO_modules.feature_pipeline import FeaturePipeline
 from TFT_PPO_modules.trading_env import TradingEnv
@@ -40,6 +70,9 @@ from TFT_PPO_Training.scripts.utils import setup_device, set_seed, ensure_dir
 from TFT_PPO_Training.scripts.optuna_tuning import tune_ppo
 from TFT_PPO_Training.scripts.wrappers import PriceTapWrapper
 from gymnasium.wrappers import TimeLimit
+
+from stable_baselines3.common.utils import get_linear_fn
+from torch import nn
 
 from TFT_PPO_modules.multi_task_tft import MultiTaskTFT, create_multi_horizon_targets
 
@@ -78,7 +111,7 @@ def load_mdpi_config(config_path):
     defaults = {
         "seed": 42,
         "data": {
-            "ohlcv_path": "user_data/datasets/ohlcv.csv",
+            "ohlcv_path": "user_data/data/binance/BTC_USDT-1h.feather",
             "asset": "BTC/USDT",
             "finetune_days": 180
         },
@@ -435,6 +468,9 @@ def run_ppo_only(
         
         env = PriceTapWrapper(env)
         
+        # ★ ActionThresholdHoldPenalty 래퍼 제거 (이산 액션에 부적합)
+        # env = ActionThresholdHoldPenalty(env, min_action_threshold=0.05, hold_penalty_bps=0.2)
+        
         # 동적 max_episode_steps 설정
         try:
             total_len = env.get_wrapper_attr("length")
@@ -468,15 +504,41 @@ def run_ppo_only(
     )
     
     # 홀드 붓박이 방지를 위한 파라미터 조정
-    best_params["ent_coef"] = min(best_params.get("ent_coef", 0.02), 0.02)  # 엔트로피 계수 제한
+    best_params["ent_coef"] = max(best_params.get("ent_coef", 0.10), 0.05)  # 엔트로피 계수 증가 (최소 0.05)
     best_params["clip_range"] = 0.2  # 클립 범위 조정
     
     print(f"[PPO] Adjusted params for final training:")
     print(f"[PPO] ent_coef={best_params['ent_coef']:.4f} | clip_range={best_params['clip_range']:.2f}")
     
+    # 엔트로피/클립 스케줄 + target_kl (정책 붕괴 방지)
+    ent_schedule = get_linear_fn(start=0.10, end=0.03, end_fraction=1.0)  # 엔트로피 증가: 0.10 → 0.03
+    clip_schedule = get_linear_fn(start=best_params.get("clip_range", 0.25),
+                                  end=max(0.15, 0.8 * best_params.get("clip_range", 0.25)),
+                                  end_fraction=1.0)
+    
     # 최종 학습
-    env = DummyVecEnv([make_env])
-    ppo = PPO("MlpPolicy", env, **best_params, seed=config.get("seed", 42), device="cpu", verbose=1)
+    venv_train = DummyVecEnv([make_env])
+    venv_train = VecNormalize(venv_train, norm_obs=True, norm_reward=True,
+                              clip_obs=10.0, clip_reward=10.0)
+    # 저장용 경로
+    vecnorm_path = "user_data/models/best/vecnorm.pkl"
+    
+    # 정책 분산 하한(log_std_init) 주기 (연속액션 σ 바닥 방지)
+    policy_kwargs = dict(
+        log_std_init=-0.5,   # 너무 작지 않게(≈σ~0.6 수준)
+        ortho_init=False,
+        activation_fn=nn.Tanh,
+    )
+    
+    # PPO 초기화 시에 스케줄 적용 + target_kl 설정
+    bp = {k:v for k,v in best_params.items() if k not in ["ent_coef", "clip_range"]}
+    ppo = PPO("MlpPolicy", venv_train,
+              policy_kwargs=policy_kwargs,
+              ent_coef=ent_schedule,
+              clip_range=clip_schedule,
+              target_kl=0.03,
+              **bp,
+              seed=config.get("seed", 42), device="cpu", verbose=1)
     
     checkpoint = ModelCheckpoint(save_dir="user_data/models/best")
     
@@ -503,6 +565,10 @@ def run_ppo_only(
     ppo.save("user_data/models/best/mdpi_ppo_policy.zip")
     print("PPO policy saved to user_data/models/best/mdpi_ppo_policy.zip")
     
+    # VecNormalize 저장
+    venv_train.save(vecnorm_path)
+    print(f"VecNormalize saved to {vecnorm_path}")
+    
     # ============================
     # 6) Evaluation (Stochastic + Deterministic)
     # ============================
@@ -510,33 +576,42 @@ def run_ppo_only(
 
     from collections import Counter
 
-    def rollout_eval(vec_env, model, deterministic=False, max_steps=10000):
+    # VecNormalize 로드하여 평가
+    venv_eval = DummyVecEnv([make_env])
+    venv_eval = VecNormalize.load(vecnorm_path, venv_eval)
+    venv_eval.training = False
+    venv_eval.norm_reward = False  # 리포트는 원단위로
+
+    def rollout(vec_env, model, deterministic, max_steps=10000):
         obs = vec_env.reset()
-        rewards, actions = [], []
+        rr = []
+        aa = []
         done = [False]
-        steps = 0
-        while not done[0] and steps < max_steps:
-            action, _ = model.predict(obs, deterministic=deterministic)
-            obs, reward, done, info = vec_env.step(action)
-            rewards.append(float(reward[0]))
-            actions.append(int(action[0]))
-            steps += 1
-        return np.asarray(rewards, dtype=np.float64), actions
+        while not done[0] and len(rr) < max_steps:
+            a, _ = model.predict(obs, deterministic=deterministic)
+            obs, r, done, _ = vec_env.step(a)
+            rr.append(float(r[0]))
+            aa.append(float(a[0]))
+        return np.asarray(rr, dtype=np.float64), np.asarray(aa, dtype=np.float32)
+
+    # 액션 분포 점검(정책이 0으로 굳었는지 즉시 확인)
+    r_det, a_det = rollout(venv_eval, ppo, True)
+    r_sto, a_sto = rollout(venv_eval, ppo, False)
+    print(f"[EVAL] det_action_std={a_det.std():.6f}, sto_action_std={a_sto.std():.6f}, "
+          f"det_steps={len(r_det)}, sto_steps={len(r_sto)}")
 
     # 1) 확률 샘플링 평가(정책이 균등에 가까울 때 argmax 고정 방지)
-    rewards_sto, actions_sto = rollout_eval(env, ppo, deterministic=False)
-    print(f"[EVAL/STO] steps={len(rewards_sto)} | action_counts={Counter(actions_sto)} "
-          f"| r_mean={np.mean(rewards_sto):.6g} r_std={np.std(rewards_sto):.6g}")
+    print(f"[EVAL/STO] steps={len(r_sto)} | action_counts={Counter(a_sto)} "
+          f"| r_mean={np.mean(r_sto):.6g} r_std={np.std(r_sto):.6g}")
 
-    metrics_sto = performance_metrics(rewards_sto, freq="1h", is_log_return=True)
+    metrics_sto = performance_metrics(r_sto, freq="1h", is_log_return=True)
     print(f"[EVAL/STO] Sharpe={metrics_sto['sharpe']:.4f} | WinRate={metrics_sto['win_rate']:.2%} | MDD={metrics_sto['mdd']:.4f}")
 
     # 2) 결정적 평가(기존 방식)도 같이 확인
-    rewards_det, actions_det = rollout_eval(env, ppo, deterministic=True)
-    print(f"[EVAL/DET] steps={len(rewards_det)} | action_counts={Counter(actions_det)} "
-          f"| r_mean={np.mean(rewards_det):.6g} r_std={np.std(rewards_det):.6g}")
+    print(f"[EVAL/DET] steps={len(r_det)} | action_counts={Counter(a_det)} "
+          f"| r_mean={np.mean(r_det):.6g} r_std={np.std(r_det):.6g}")
 
-    metrics_det = performance_metrics(rewards_det, freq="1h", is_log_return=True)
+    metrics_det = performance_metrics(r_det, freq="1h", is_log_return=True)
     print(f"[EVAL/DET] Sharpe={metrics_det['sharpe']:.4f} | WinRate={metrics_det['win_rate']:.2%} | MDD={metrics_det['mdd']:.4f}")
 
     # 체크포인트는 확률 평가 기준으로
@@ -590,15 +665,15 @@ def main():
     
     # 파일 존재 확인
     if not os.path.exists(args.tft_ckpt):
-        print(f"❌ ERROR: TFT checkpoint not found: {args.tft_ckpt}")
+        print(f"ERROR: TFT checkpoint not found: {args.tft_ckpt}")
         sys.exit(1)
     
     if not os.path.exists(args.scaler):
-        print(f"❌ ERROR: Scaler not found: {args.scaler}")
+        print(f"ERROR: Scaler not found: {args.scaler}")
         sys.exit(1)
     
     if not os.path.exists(args.config):
-        print(f"❌ ERROR: Config file not found: {args.config}")
+        print(f"ERROR: Config file not found: {args.config}")
         sys.exit(1)
     
     try:

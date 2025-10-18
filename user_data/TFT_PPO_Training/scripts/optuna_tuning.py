@@ -134,196 +134,98 @@ def max_drawdown_equity(eq):
 # =========================
 def _evaluate_vectorized(model, make_env_fn, episodes: int = 3, fee_bps: float = 10.0, ann_factor: float = 365.0):
     """
-    모델의 행동으로 전이기반 엔트리/엑싯을 만들고, 간단 롱온리 PnL/Sharpe를 계산.
-    - fee_bps: 왕복 수수료 기준 bps
-    - ann_factor: 연율화 계수(시계열 주기에 맞게 전달)
+    간단한 환경 보상 기반 평가 (필터 적용된 환경 사용)
     """
     from gymnasium.wrappers import TimeLimit
 
     scores = []
 
-    # 길이 추정
-    probe_env = make_env_fn(offset=0)
-    try:
-        length_hint = None
-        try:
-            length_hint = probe_env.get_wrapper_attr("length")
-        except Exception:
-            pass
-        if length_hint is None:
-            length_hint = getattr(getattr(probe_env, "unwrapped", probe_env), "length", None)
-        if length_hint is None:
-            length_hint = getattr(probe_env, "n_steps", None)
-        if length_hint is None:
-            length_hint = 10_000
-        print(f"[EvalDebug] Detected data length: {length_hint}")
-    except Exception as e:
-        print(f"[EvalDebug] Failed to detect data length: {e}, using default 10000")
-        length_hint = 10_000
-    finally:
-        probe_env.close()
-
-    safe_max_offset = max(100, int(length_hint * 0.5))
-    raw_offsets = [0, min(1500, safe_max_offset // 2)]
-    offsets = raw_offsets[: max(1, min(episodes, 2))]
-    print(f"[EvalDebug] Using offsets: {offsets} (data_length={length_hint}) [SPEED MODE]")
-
-    for off in offsets:
-        env = make_env_fn(offset=off)
+    for episode in range(episodes):
+        env = make_env_fn(offset=episode * 500)  # 서로 다른 시작점
         eval_max_steps = 1000
         if not isinstance(env, TimeLimit):
             env = TimeLimit(env, max_episode_steps=eval_max_steps)
 
-        out = env.reset()
-        if isinstance(out, tuple) and len(out) == 2:
-            obs, info = out
-        else:
-            obs, info = out, {}
-        closes, acts = [], []
+        obs = env.reset()[0]
+        rewards = []
+        trade_count = 0
         done = False
+        
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
-            # close 수집
-            if isinstance(info, dict) and "close" in info:
-                closes.append(info["close"])
-            elif isinstance(info, dict) and "price" in info:
-                closes.append(info["price"])
-            elif hasattr(env, "unwrapped") and hasattr(env.unwrapped, "prices"):
-                p = env.unwrapped.prices
-                idx = min(len(closes), len(p) - 1)
-                closes.append(float(p[idx]))
-            acts.append(int(action))
+            rewards.append(float(reward))
+            
+            # ✅ 실제 거래 카운트
+            if isinstance(info, dict):
+                trade_count += int(info.get("trade", 0))
 
         env.close()
-        if len(closes) < 50:
-            print("[EvalDebug] too short episode; returning penalty")
+        
+        # 보상 기반 점수 계산
+        if len(rewards) < 10:
             scores.append(-1.0)
             continue
-
-        # 전이 기반 엔트리/엑싯
-        a = np.asarray(acts, dtype=int)  # 0=Hold, 1=Buy, 2=Sell 등 가정
-        prev = np.roll(a, 1)
-        prev[0] = 0
-        enter_long = (a == 1) & (prev != 1)
-        exit_long = (prev == 1) & (a != 1)
-
-        if not enter_long.any() and (a == 1).any():
-            first_buy_idx = int(np.argmax(a == 1))
-            enter_long[first_buy_idx] = True
-
-        pos = np.zeros_like(a, dtype=int)
-        open_flag = 0
-        for t in range(len(a)):
-            if open_flag == 0 and enter_long[t]:
-                open_flag = 1
-            elif open_flag == 1 and exit_long[t]:
-                open_flag = 0
-            pos[t] = open_flag
-
-        force_exit = False
-        if open_flag == 1:
-            exit_long[-1] = True
-            force_exit = True
-
-        ent_idx = np.where(enter_long)[0]
-        ex_idx = np.where(exit_long)[0]
-        pairs, j = [], 0
-        for i in ent_idx:
-            while j < len(ex_idx) and ex_idx[j] <= i:
-                j += 1
-            if j < len(ex_idx):
-                pairs.append((i, ex_idx[j]))
-                j += 1
-
-        if len(pairs) == 0:
-            scores.append(-1.0)
-            continue
-
-        c = np.array(closes, dtype=float)
-        ret = np.zeros_like(c)
-        ret[1:] = np.log(c[1:] / c[:-1])
-        pnl = pos * ret
-
-        # 수수료
-        delta_pos = np.zeros_like(pos)
-        delta_pos[1:] = pos[1:] - pos[:-1]
-        half_fee = (fee_bps / 1e4) / 2.0
-        fees = np.abs(delta_pos) * half_fee
-        pnl_after_fee = pnl - fees
-
-        # KPI
-        if len(pnl_after_fee) < 2:
-            sharpe = -1.0
-        else:
-            mu = float(np.mean(pnl_after_fee))
-            sd = float(np.std(pnl_after_fee, ddof=1))
-            sharpe = (mu / sd) * math.sqrt(ann_factor) if sd > 0 and np.isfinite(sd) else -1.0
-
-        wins = 0
-        equity = [1.0]
-        cur = 1.0
-        for t in range(1, len(c)):
-            cur *= np.exp(pnl_after_fee[t])
-            equity.append(cur)
-        for i, j in pairs:
-            trade_logret = np.sum(pnl_after_fee[i + 1 : j + 1])
-            wins += 1 if trade_logret > 0 else 0
-        winrate = wins / max(1, len(pairs))
-        maxdd = max_drawdown_equity(equity)
-
-        score_ep = (
-            0.6 * np.clip(sharpe, -2.0, 5.0)
-            + 0.3 * (winrate - 0.5) * 2.0
-            + -0.1 * np.clip(maxdd, 0.0, 0.5) * 5
-        )
-        scores.append(float(score_ep))
+            
+        score = _score_rewards(rewards, freq="1h", trades_override=trade_count)
+        scores.append(score)
 
     score = float(np.mean(scores))
     print(f"[EvalDebug] Evaluation score: {score:.6f}")
     return score
 
 
-def _score_rewards(rewards, freq="1h"):
+def _score_rewards(rewards, freq="1h", trades_override=None):
     """보상 시퀀스를 KPI 점수로 변환 - 상세 로그 포함(스피드모드에서 사용)"""
     if not rewards or len(rewards) < 10:
         print(f"[EvalDebug] Too short rewards: len={len(rewards) if rewards else 0} -> penalty -1.0")
         return -1.0
 
     rew = np.array(rewards, dtype=float)
-    changes = np.diff(rew) if len(rew) > 1 else np.array([])
-    trades = np.sum(np.abs(changes) > 1e-6)
-
     mu = float(np.mean(rew))
     sd = float(np.std(rew, ddof=1))
     if sd == 0 or not np.isfinite(sd):
         sharpe = -1.0
     else:
-        ann_factor = 24 * 365 if freq in ["1h", "h", "hour", "hourly"] else 365
-        sharpe = (mu / sd) * math.sqrt(ann_factor)
+        ann = 24*365 if freq in ["1h", "h", "hour", "hourly"] else 365
+        sharpe = (mu / sd) * math.sqrt(ann)
 
     winrate = float(np.mean(rew > 0))
-    # ✅ Drawdown: 로그수익 → 에쿼티로 변환 후 DD
-    equity = np.exp(np.cumsum(rew))  # 시작 1.0 기준
+    equity = np.exp(np.cumsum(rew))
     peak = np.maximum.accumulate(equity)
     dd = float(np.max((peak - equity) / np.maximum(peak, 1e-12)))
 
+    # ✅ 거래 횟수는 override가 있으면 그것을 사용
+    if trades_override is not None:
+        trades = int(trades_override)
+    else:
+        trades = 0  # 안전 기본값
+
+    # 과매매 페널티 기준을 "스텝 대비 비율"로 변경
+    steps = len(rew)
+    overtrading_ratio = trades / max(1, steps)
+    penalty_reason = "none"
+
     if trades == 0:
-        score = -1.75
+        score = -2.0
         penalty_reason = "trades=0"
+    elif trades < 5:
+        score = -1.5 + (trades / 5.0) * 0.5
+        penalty_reason = f"trades={trades}<5"
+    elif overtrading_ratio > 0.5:              # 스텝의 50% 초과 거래면 과매매
+        score = -1.0
+        penalty_reason = f"overtrading={trades}"
     else:
         score = (
             0.6 * np.clip(sharpe, -2.0, 5.0)
             + 0.3 * (winrate - 0.5) * 2.0
-            + -0.1 * np.clip(dd, 0.0, 0.5) * 5
+            - 0.1 * np.clip(dd, 0.0, 0.5) * 5
+            + 0.1 * np.clip(trades / 50.0, 0.0, 1.0)
         )
         penalty_reason = "none"
 
-    print(
-        f"[EvalDebug] len={len(rew)} | trades={trades} | sharpe={sharpe:.3f} | "
-        f"winrate={winrate:.3f} | mdd={dd:.3f} | penalty={penalty_reason} -> score={score:.3f}"
-    )
+    print(f"[EvalDebug] len={len(rew)} | trades={trades} | sharpe={sharpe:.3f} | winrate={winrate:.3f} | mdd={dd:.3f} | penalty={penalty_reason} -> score={score:.3f}")
     print(f"[EvalDebug] reward_stats: mean={mu:.6f} | std={sd:.6f} | min={rew.min():.6f} | max={rew.max():.6f}")
     return float(score)
 
@@ -394,9 +296,10 @@ def tune_ppo(
 
         # 1) 탐색공간 & 안전 클램프
         params = _suggest_params(trial, ocfg["search_space"])
-        params["ent_coef"] = float(np.clip(params.get("ent_coef", 0.0), 0.0, 0.02))
+        # SB3 일반 권장 범위에 맞춰 보수적으로 (탐색 과잉 방지)
+        params["ent_coef"] = float(np.clip(params.get("ent_coef", 0.0), 0.0, 0.05))
         params["clip_range"] = float(np.clip(params.get("clip_range", 0.2), 0.10, 0.25))
-        params["gamma"] = float(np.clip(params.get("gamma", 0.99), 0.985, 0.999))
+        params["gamma"] = float(np.clip(params.get("gamma", 0.99), 0.98, 0.995))  # 감마 범위 현실적으로 조정
         params["batch_size"] = int(params.get("batch_size", 256))
         print(f"[PARAM-OVERRIDE] ent_coef={params['ent_coef']:.4f} clip_range={params['clip_range']:.2f} gamma={params['gamma']:.3f} batch={params['batch_size']}")
 
@@ -421,10 +324,18 @@ def tune_ppo(
         def make_trial_env():
             trial_seed = main_config.get("seed", 42) + trial.number
             env = env_fn(trial_seed=trial_seed)  # 사용자가 넘기는 TradingEnv factory
+            
+            # ⚙️ 환경 생성 시 옵션 강제 통일: 보상/비용/모드
+            env.reward_mode = "pnl_delta"
+            env.fee_rate = 3 / 1e4  # fee_bps=3
+            env.slippage_rate = 1 / 1e4  # slippage_bps=1
+            if hasattr(env, "sanity_mode"):
+                env.sanity_mode = False  # 학습은 False로
+            
             env = StickyActionWrapper(env, prob=0.25)
             # 액션 안정화를 위한 최소 보유시간 + 쿨다운 래퍼 추가
             from TFT_PPO_Training.scripts.wrappers import MinHoldCooldownWrapper
-            env = MinHoldCooldownWrapper(env, min_hold=3, cooldown=2)
+            env = MinHoldCooldownWrapper(env, min_hold=3, cooldown=2)  # 과매매 방지 완화
             if hasattr(env, "reset"):
                 env.reset(seed=trial_seed)
             return env
@@ -456,6 +367,17 @@ def tune_ppo(
             ev.ret_rms = venv.ret_rms
             ev.training = False
             ev.norm_reward = False
+            
+            # ⚙️ 평가 환경도 동일한 옵션 적용
+            for env in ev.envs:
+                if hasattr(env, 'env'):
+                    env = env.env
+                env.reward_mode = "pnl_delta"
+                env.fee_rate = 3 / 1e4  # fee_bps=3
+                env.slippage_rate = 1 / 1e4  # slippage_bps=1
+                if hasattr(env, "sanity_mode"):
+                    env.sanity_mode = False
+            
             return ev
 
         def _evaluate_with_vecnorm(model, steps=1000) -> float:
@@ -466,6 +388,7 @@ def tune_ppo(
                 ev.envs[0] = TimeLimit(ev.envs[0], max_episode_steps=int(steps))
             obs = ev.reset()[0]
             rewards, done = [], False
+            trade_count = 0
             while not done:
                 action, _ = model.predict(obs, deterministic=True)
                 # DummyVecEnv는 배열을 기대하므로 액션을 배열로 감싸기
@@ -476,8 +399,22 @@ def tune_ppo(
                 obs, reward, dones, infos = ev.step(action)
                 done = bool(dones[0])
                 rewards.append(float(reward[0]))
+                
+                # ✨ 환경 info에서 실제 거래수 합산 (VecNormalize 환경 고려)
+                if isinstance(infos, (list, tuple)) and len(infos) > 0:
+                    info = infos[0]
+                    if isinstance(info, dict):
+                        trade_flag = int(info.get("trade", 0))
+                        trade_count += trade_flag
+                        if trade_flag > 0:  # 디버깅용
+                            print(f"[DEBUG] Trade detected: {trade_flag}")
+                    elif hasattr(info, 'get'):
+                        trade_flag = int(info.get("trade", 0))
+                        trade_count += trade_flag
+                        if trade_flag > 0:  # 디버깅용
+                            print(f"[DEBUG] Trade detected: {trade_flag}")
             ev.close()
-            return _score_rewards(rewards, freq=data_freq)
+            return _score_rewards(rewards, freq=data_freq, trades_override=trade_count)
 
         learned = 0
         best_score = -np.inf
@@ -507,7 +444,7 @@ def tune_ppo(
                             env = make_env_with_offset(df_ppo, tft_model, feature_pipeline.features, offset)()
                             env = StickyActionWrapper(env, prob=0.25)
                             from TFT_PPO_Training.scripts.wrappers import MinHoldCooldownWrapper
-                            env = MinHoldCooldownWrapper(env, min_hold=3, cooldown=2)
+                            env = MinHoldCooldownWrapper(env, min_hold=3, cooldown=2)  # 과매매 방지 완화
                             if hasattr(env, "reset"):
                                 env.reset(seed=trial_seed)
                             return env
@@ -516,9 +453,17 @@ def tune_ppo(
                         def make_offset_env():
                             trial_seed = main_config.get("seed", 42) + trial.number
                             env = env_fn()
+                            
+                            # ⚙️ 환경 생성 시 옵션 강제 통일: 보상/비용/모드
+                            env.reward_mode = "pnl_delta"
+                            env.fee_rate = 3 / 1e4  # fee_bps=3
+                            env.slippage_rate = 1 / 1e4  # slippage_bps=1
+                            if hasattr(env, "sanity_mode"):
+                                env.sanity_mode = False
+                            
                             env = StickyActionWrapper(env, prob=0.25)
                             from TFT_PPO_Training.scripts.wrappers import MinHoldCooldownWrapper
-                            env = MinHoldCooldownWrapper(env, min_hold=3, cooldown=2)
+                            env = MinHoldCooldownWrapper(env, min_hold=3, cooldown=2)  # 과매매 방지 완화
                             if hasattr(env, "reset"):
                                 env.reset(seed=trial_seed)
                             return env
@@ -541,6 +486,7 @@ def tune_ppo(
                             ev.envs[0] = TimeLimit(ev.envs[0], max_episode_steps=int(steps))
                         obs = ev.reset()[0]
                         rewards, done = [], False
+                        trade_count = 0
                         while not done:
                             action, _ = model.predict(obs, deterministic=True)
                             # DummyVecEnv는 배열을 기대하므로 액션을 배열로 감싸기
@@ -551,8 +497,12 @@ def tune_ppo(
                             obs, reward, dones, infos = ev.step(action)
                             done = bool(dones[0])
                             rewards.append(float(reward[0]))
+                            
+                            # ✨ 환경 info에서 실제 거래수 합산
+                            if isinstance(infos, (list, tuple)) and len(infos) > 0 and isinstance(infos[0], dict):
+                                trade_count += int(infos[0].get("trade", 0))
                         ev.close()
-                        return _score_rewards(rewards, freq=data_freq)
+                        return _score_rewards(rewards, freq=data_freq, trades_override=trade_count)
                     
                     score = _evaluate_offset(model, steps=eval_max_steps)
                     scores.append(score)

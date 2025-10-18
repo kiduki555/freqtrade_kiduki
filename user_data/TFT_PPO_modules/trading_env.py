@@ -31,6 +31,7 @@ class TradingEnv(gym.Env):
         slippage_bps: float = 5,          # 체결 슬리피지
         reward_mode: str = "pnl",         # "pnl" | "custom"
         reward_func=custom_reward,
+        sanity_mode: bool = False,        # sanity 모드 플래그 (기본값: False)
     ):
         super().__init__()
 
@@ -72,9 +73,15 @@ class TradingEnv(gym.Env):
         self.vol_ewm = 0.0                  # 지수 가중 변동성
         self.streak = 0                     # 연속 액션 카운트
         self.last_action = 0                # 이전 액션
+        self.hold_streak = 0                # 연속 hold 카운트 (무거래 방지)
+        self.position_changes = 0           # 포지션 변경 횟수 (다양성 보너스용)
         
-        # === 액션 필터 (학습용 완화) ===
-        self.action_filter = ActionFilter(hysteresis=1, cooldown=2)  # 제약 완화
+        # === sanity 모드 (디버깅용) - 먼저 설정 ===
+        self.sanity_mode = sanity_mode
+        
+        # === 액션 필터 (과매매 방지 강화) ===
+        # 모든 모드에서 필터 비활성화 (거래 발생 보장)
+        self.action_filter = None  # 필터 완전 비활성화
 
         # === Spaces (Gymnasium style) ===
         self.action_space = gym.spaces.Discrete(3)  # 0=Flat, 1=Long, 2=Short
@@ -213,8 +220,11 @@ class TradingEnv(gym.Env):
         # 로그 수익률 계산
         logret = np.log((next_price + 1e-12) / (curr_price + 1e-12))
 
-        # 액션 필터링 적용
-        filtered_action = self.action_filter.step(int(action))
+        # 액션 필터링 적용 (sanity 모드에서는 필터 비활성화)
+        if self.action_filter is not None:
+            filtered_action = self.action_filter.step(int(action))
+        else:
+            filtered_action = int(action)  # 필터 없이 그대로 사용
         
         # 액션→목표 포지션 매핑
         target_pos = {0: 0, 1: +1, 2: -1}[filtered_action]
@@ -223,44 +233,112 @@ class TradingEnv(gym.Env):
         # 1) PnL 델타 계산
         pnl_delta = float(self.position) * float(logret)
         
-        # 2) 수수료 계산
-        fees = 0.0
-        if target_pos != self.position:
-            if target_pos != 0 and self.position == 0:  # 진입
-                fees -= self.fee_rate
-            elif target_pos == 0 and self.position != 0:  # 청산
-                fees -= self.fee_rate
-            
+        # 2) 수수료: 항상 양수 비용으로 누적, 플립(±1↔∓1) 시 2번 청구
+        fee_cost = 0.0
+        position_changed = (target_pos != self.position)
+        if position_changed:
+            if self.position != 0:   # 기존 포지션 청산
+                fee_cost += self.fee_rate
+            if target_pos != 0:      # 새 포지션 진입
+                fee_cost += self.fee_rate
+        
+        # sanity 모드에서 수수료 완화
+        if getattr(self, "sanity_mode", False):
+            fee_cost *= 0.1  # 수수료를 1/10로 완화
+
+        # 포지션 적용
+        if position_changed:
             self.position = target_pos
             self.entry_price = curr_price if self.position != 0 else None
-
-        # 3) 드로우다운 계산 (증가 패널티)
+            self.position_changes += 1
+        
+        # 3) 무거래 방지 로직
+        if target_pos == 0:  # hold 액션
+            self.hold_streak += 1
+        else:
+            self.hold_streak = 0
+        
+        # 4) 거래 인센티브 및 포지션 다양성 보너스
+        trading_bonus = 0.0
+        if position_changed:
+            trading_bonus = 0.0001  # 소량의 거래 인센티브
+        
+        # 5) 연속 hold 페널티 (무거래 방지)
+        hold_penalty = 0.0
+        if self.hold_streak > 20:  # 20스텝 이상 연속 hold
+            hold_penalty = 0.00005 * (self.hold_streak - 20)  # 점진적 페널티
+        
+        # 6) 과매매 방지 (거래 빈도 제한) + 턴오버 페널티
+        overtrading_penalty = 0.0
+        turnover_penalty = 0.0
+        
+        if position_changed:
+            # 최근 10스텝 내 거래 횟수 체크
+            recent_trades = getattr(self, 'recent_trades', [])
+            recent_trades.append(1)  # 거래 발생
+            if len(recent_trades) > 10:
+                recent_trades.pop(0)  # 오래된 기록 제거
+            self.recent_trades = recent_trades
+            
+            # 10스텝 내 5회 이상 거래 시 페널티
+            if len(recent_trades) >= 5 and sum(recent_trades) >= 5:
+                overtrading_penalty = 0.001  # 과매매 페널티
+            
+            # 턴오버 페널티 (거래 비용 추가)
+            turnover_penalty = 0.0005  # 거래당 추가 비용
+            
+            # sanity 모드에서 페널티 완화
+            if self.sanity_mode:
+                overtrading_penalty *= 0.2
+                turnover_penalty *= 0.2
+        
+        # 6) 드로우다운/에쿼티 업데이트 (수수료는 반드시 빼기)
         dd_before = self._drawdown(self.equity_peak, self.equity)
-        self.equity *= np.exp(pnl_delta + fees)
+        equity_next = self.equity * np.exp(pnl_delta - fee_cost)
+        self.equity = equity_next
         self.equity_peak = max(self.equity_peak, self.equity)
         dd_after = self._drawdown(self.equity_peak, self.equity)
 
-        # 4) 최종 보상 계산 (스케일링 + 클리핑)
-        reward = pnl_delta - fees - 0.3 * max(0.0, dd_after - dd_before)  # DD 증가 패널티
-        reward = float(np.clip(reward, -0.01, 0.01))  # 스케일/클립
+        # 7) 보상 계산 (수수료는 마이너스)
+        reward = (
+            pnl_delta
+            - fee_cost
+            - 0.1 * max(0.0, dd_after - dd_before)
+            + trading_bonus
+            - hold_penalty
+            - overtrading_penalty
+            - turnover_penalty
+        )
+
+        # ✅ 순이익(pnl_delta - fee_cost) > 0 이면 최소 양수 보상 보장
+        if (pnl_delta - fee_cost) > 0:
+            if getattr(self, "sanity_mode", False):
+                reward = max(reward, 0.01)  # sanity 모드: 더 강한 플로어
+            else:
+                reward = max(reward, 0.001)  # 정상 모드: 기본 플로어
+
+        reward = float(np.clip(reward, -0.05, 0.05))
         
-        # 5) 에피소드 보상 추적
+        # 8) 에피소드 보상 추적
         if not hasattr(self, 'episode_rewards'):
             self.episode_rewards = []
         self.episode_rewards.append(reward)
         
-        # 6) 에피소드 종료 시 Sharpe 보너스
+        # 9) 에피소드 종료 시 Sharpe 보너스 + 거래 다양성 보너스
         done = self.current_step >= len(self.df) - 2
         if done and len(self.episode_rewards) > 10:
             r = np.asarray(self.episode_rewards, dtype=np.float64)
             sharpe = float(np.mean(r) / (np.std(r) + 1e-8)) * np.sqrt(24*365)  # 1h이면 24*365
             reward += 0.01 * np.tanh(sharpe)
+            
+            # 거래 다양성 보너스 (포지션 변경 횟수 기반)
+            if self.position_changes > 5:  # 최소 5회 이상 거래
+                diversity_bonus = 0.005 * min(self.position_changes / 20, 1.0)  # 최대 0.005
+                reward += diversity_bonus
         
-        self.prev_action = target_pos  # 다음 스텝을 위해 저장
-        
-        # 디버그용 변수들
-        trade_cost = fees
-        trade_flag = int(target_pos != self.prev_action)
+        # 8) 거래 플래그는 '포지션 변경 여부'로!
+        trade_flag = int(position_changed)
+        self.prev_action = target_pos
 
         self.current_step += 1
         if self.current_step >= len(self.df) - 2:
@@ -268,7 +346,7 @@ class TradingEnv(gym.Env):
 
         obs = self._encode_state()
         info = {
-            "pnl_step": float(self.position) * float(logret) - trade_cost,
+            "pnl_step": float(self.position) * float(logret) - fee_cost,
             "equity": float(self.equity),
             "position": int(self.position),
             "trade": int(trade_flag),
@@ -312,7 +390,12 @@ class TradingEnv(gym.Env):
         self.vol_ewm = 0.0
         self.streak = 0
         self.last_action = 0
-        self.action_filter.reset()
+        self.hold_streak = 0
+        self.position_changes = 0
+        self.recent_trades = []  # 과매매 방지용 거래 기록 초기화
+        # 액션 필터 리셋 (필터가 있는 경우만)
+        if self.action_filter is not None:
+            self.action_filter.reset()
         obs = self._encode_state()
         info = {}
         return obs, info

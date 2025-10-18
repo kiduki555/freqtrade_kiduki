@@ -1,6 +1,6 @@
 # user_data/TFT_PPO_Training/configs/optuna_config.yml
 optuna:
-  study_name: "PPO_TFT_KPI_Optimization"
+  study_name: "PPO_TFT_KPI_Optimization_V3"
   direction: "maximize"
   storage: "sqlite:///user_data/TFT_PPO_Training/logs/optuna_studies/ppo_tft.db"
   n_trials: 20
@@ -16,10 +16,10 @@ optuna:
     min_resource: 1
     reduction_factor: 3
   search_space:
-    learning_rate: { type: "loguniform", low: 5.0e-5, high: 1.0e-3 }
-    gamma:         { type: "uniform",    low: 0.90,  high: 0.99 }
-    clip_range:    { type: "uniform",    low: 0.1,   high: 0.4 }
-    ent_coef:      { type: "uniform",    low: 0.02,  high: 0.15 }
+    learning_rate: { type: "loguniform", low: 1.0e-5, high: 5.0e-4 }
+    gamma:         { type: "uniform",    low: 0.985,  high: 0.999 }
+    clip_range:    { type: "uniform",    low: 0.10,   high: 0.30 }
+    ent_coef:      { type: "loguniform", low: 1.0e-5, high: 5.0e-2 }
     batch_size:    { type: "categorical", choices: [256, 512, 1024] }
-    vf_coef:       { type: "uniform",    low: 0.3,   high: 1.2 }
-    max_grad_norm: { type: "uniform",    low: 0.2,   high: 1.0 }
+    vf_coef:       { type: "uniform",    low: 0.5,    high: 1.2 }
+    max_grad_norm: { type: "uniform",    low: 0.3,   high: 1.0 }
