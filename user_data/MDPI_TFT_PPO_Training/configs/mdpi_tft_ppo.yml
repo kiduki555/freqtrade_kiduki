@@ -1,0 +1,55 @@
+# MDPI TFT + PPO 통합 학습 설정
+seed: 42
+
+# 데이터 설정
+data:
+  ohlcv_path: user_data/data/binance/BTC_USDT-1h.feather
+  asset: BTC/USDT
+  finetune_days: 180  # PPO 파인튜닝용 최근 데이터 일수
+
+# 데이터 분할 설정
+split:
+  train_val_cut: "2024-06-01"  # TFT 학습/검증 분할점
+
+# TFT 모델 설정
+tft:
+  enc_len: 64                    # 인코더 길이
+  hidden_size: 160               # 히든 사이즈
+  attention_heads: 4            # 어텐션 헤드 수
+  dropout: 0.2                   # 드롭아웃 비율
+  horizons: [24, 48, 96]         # 멀티-호라이즌 타깃
+  train_split: 0.8               # 학습/검증 분할 비율
+  batch_size: 128               # 배치 사이즈
+  max_epochs: 50                # 최대 에폭 수
+  learning_rate: 1e-3           # 학습률
+  grad_clip: 1.0                # 그래디언트 클리핑
+  early_stopping:
+    patience: 8                  # 조기종료 인내심
+    min_delta: 1e-4             # 최소 개선폭
+  loss_weights:                 # 멀티태스크 손실 가중치
+    returns: 1.0                 # 수익률 예측 (주요)
+    direction: 1.5               # 방향성 예측 (가중치 최대화)
+    volatility: 0.25             # 변동성 예측 (보조)
+
+# PPO 모델 설정
+ppo:
+  timesteps: 100000             # 총 학습 스텝 수
+  learning_rate: 3e-4           # 학습률
+  n_steps: 2048                 # 업데이트당 스텝 수
+  batch_size: 64                # 배치 사이즈
+  n_epochs: 10                  # 업데이트당 에폭 수
+  gamma: 0.99                   # 할인 인수
+  gae_lambda: 0.95              # GAE 람다
+  clip_range: 0.2               # 클리핑 범위
+  ent_coef: 0.01                # 엔트로피 계수
+  vf_coef: 0.5                  # 가치 함수 계수
+  max_grad_norm: 0.5            # 최대 그래디언트 노름
+
+# 로깅 설정 (선택사항)
+logging:
+  use_wandb: false               # Weights & Biases 사용 여부
+  wandb_project: "mdpi-tft-ppo"
+  wandb_entity: null
+
+# 시간프레임 설정
+timeframe: "1h"                 # 데이터 시간프레임

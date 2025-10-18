@@ -2,6 +2,51 @@
 import gymnasium as gym
 import numpy as np
 
+class MinHoldCooldownWrapper(gym.Wrapper):
+    """액션 안정화를 위한 최소 보유시간 + 쿨다운 래퍼"""
+    def __init__(self, env, min_hold=3, cooldown=2):
+        super().__init__(env)
+        self.min_hold = int(min_hold)
+        self.cooldown = int(cooldown)
+        self._hold = 0
+        self._cool = 0
+        self._last_action = 0  # 0=Hold, 1=Buy, 2=Sell
+
+    def reset(self, **kwargs):
+        self._hold = 0
+        self._cool = 0
+        self._last_action = 0
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        a = int(action)
+
+        # 쿨다운 중엔 진입/청산 제한
+        if self._cool > 0:
+            if a in (1,2):  # 방향 전환성 액션
+                a = 0
+
+        # 최소 보유시간: 직전이 Buy 상태였다면 즉시 Sell 금지
+        # env에 현재 포지션을 노출한다면 활용(없으면 _last_action으로 보수적 제한)
+        if self._hold < self.min_hold and self._last_action == 1 and a == 2:
+            a = 0
+
+        obs, reward, terminated, truncated, info = self.env.step(a)
+
+        # 타이머 갱신
+        if a == 1:  # 진입
+            self._hold = 1
+            self._cool = self.cooldown
+        elif a == 0 and self._hold > 0:  # 유지
+            self._hold += 1
+            self._cool = max(0, self._cool - 1)
+        elif a == 2:  # 청산
+            self._hold = 0
+            self._cool = self.cooldown
+
+        self._last_action = a
+        return obs, reward, terminated, truncated, info
+
 class PriceTapWrapper(gym.Wrapper):
     """
     step()의 info에 'close'를 항상 넣어주는 래퍼.

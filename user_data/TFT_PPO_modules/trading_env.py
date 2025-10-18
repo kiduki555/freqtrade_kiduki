@@ -53,6 +53,7 @@ class TradingEnv(gym.Env):
         self.position = 0           # -1, 0, +1
         self.entry_price = None
         self.equity = 1.0
+        self.equity_peak = 1.0      # 드로우다운 계산용 최고점
         self.prev_action = 0
         
         # === KPI 정렬 보상 파라미터 ===
@@ -72,8 +73,8 @@ class TradingEnv(gym.Env):
         self.streak = 0                     # 연속 액션 카운트
         self.last_action = 0                # 이전 액션
         
-        # === 액션 필터 (개선) ===
-        self.action_filter = ActionFilter(hysteresis=2, cooldown=5)
+        # === 액션 필터 (학습용 완화) ===
+        self.action_filter = ActionFilter(hysteresis=1, cooldown=2)  # 제약 완화
 
         # === Spaces (Gymnasium style) ===
         self.action_space = gym.spaces.Discrete(3)  # 0=Flat, 1=Long, 2=Short
@@ -90,25 +91,42 @@ class TradingEnv(gym.Env):
         """상태 인코딩 - TFT 학습된 표현 활용 (옵션)"""
         window_df = self.df[self.features].iloc[self.current_step - self.window : self.current_step]
         
-        # 옵션 1: TFT 학습된 표현 사용 (복잡하지만 강력)
+        # 옵션 1: TFT 학습된 표현 사용 (강력한 방법)
         if hasattr(self, 'use_tft_encoding') and self.use_tft_encoding:
             try:
-                x = torch.tensor(window_df.values, dtype=torch.float32).unsqueeze(0)
-                # TFT의 encoder 부분만 사용 (간단한 방법)
+                # TFT 입력 형태로 데이터 준비
+                x = torch.tensor(window_df.values, dtype=torch.float32).unsqueeze(0)  # (1, window, features)
+                
                 with torch.no_grad():
-                    # TFT의 encoder 부분만 추출 (전체 모델 대신)
-                    if hasattr(self.tft, 'encoder'):
-                        encoded = self.tft.encoder(x)
-                        return encoded.squeeze().cpu().numpy().astype(np.float32)
+                    # MultiTaskTFT의 forward 메서드 사용
+                    tft_input = {
+                        "encoder_cont": x,
+                        "encoder_lengths": torch.tensor([self.window], dtype=torch.long),
+                        "decoder_lengths": torch.tensor([1], dtype=torch.long),
+                    }
+                    
+                    # TFT 예측 수행
+                    predictions = self.tft(tft_input)
+                    
+                    # encoder representation 추출
+                    if "encoder_repr" in predictions:
+                        encoded = predictions["encoder_repr"]
                     else:
-                        # TFT 전체 모델 사용 시 필요한 입력 구성
-                        tft_input = {
-                            "encoder_cont": x,
-                            "encoder_lengths": torch.tensor([self.window], dtype=torch.long),
-                            "decoder_lengths": torch.tensor([1], dtype=torch.long),
-                        }
-                        state = self.tft(tft_input)
-                        return state.squeeze().cpu().numpy().astype(np.float32)
+                        # fallback: 수익률 예측값 사용
+                        encoded = predictions["returns"]["horizon_24"]
+                    
+                    # 64차원으로 맞추기
+                    encoded_np = encoded.squeeze().cpu().numpy().astype(np.float32)
+                    if len(encoded_np) < 64:
+                        # 패딩
+                        padded = np.pad(encoded_np, (0, 64 - len(encoded_np)), 'constant')
+                        return padded
+                    elif len(encoded_np) > 64:
+                        # 자르기
+                        return encoded_np[:64]
+                    else:
+                        return encoded_np
+                        
             except Exception as e:
                 print(f"[Warning] TFT encoding failed: {e}, falling back to simple encoding")
         
@@ -172,6 +190,12 @@ class TradingEnv(gym.Env):
         curr = float(self.df["close"].iloc[self.current_step])
         nxt = float(self.df["close"].iloc[self.current_step + 1])
         return curr, nxt
+    
+    def _drawdown(self, peak, current):
+        """드로우다운 계산"""
+        if peak <= 0:
+            return 0.0
+        return (peak - current) / peak
 
     # -----------------------------
     # Step
@@ -195,51 +219,48 @@ class TradingEnv(gym.Env):
         # 액션→목표 포지션 매핑
         target_pos = {0: 0, 1: +1, 2: -1}[filtered_action]
 
-        # === KPI 정렬 보상 계산 ===
-        # 1) 기본 수익률 보상
-        reward_return = float(self.position) * float(logret)
+        # === 새로운 보상 리셰이핑 ===
+        # 1) PnL 델타 계산
+        pnl_delta = float(self.position) * float(logret)
         
-        # 2) 수수료 (진입/청산 시에만)
-        fee = 0.0
-        position_changed_to_open = False
-        position_changed_to_close = False
-        
+        # 2) 수수료 계산
+        fees = 0.0
         if target_pos != self.position:
             if target_pos != 0 and self.position == 0:  # 진입
-                fee -= self.fee_rate
-                position_changed_to_open = True
+                fees -= self.fee_rate
             elif target_pos == 0 and self.position != 0:  # 청산
-                fee -= self.fee_rate
-                position_changed_to_close = True
+                fees -= self.fee_rate
             
             self.position = target_pos
             self.entry_price = curr_price if self.position != 0 else None
 
-        # 3) 에쿼티 업데이트 및 드로우다운 페널티
-        self.equity *= np.exp(reward_return + fee)
-        self.peak_equity = max(self.peak_equity, self.equity)
-        dd = (self.peak_equity - self.equity) / max(self.peak_equity, 1e-9)
-        pen_dd = -self.dd_coef * dd
+        # 3) 드로우다운 계산 (증가 패널티)
+        dd_before = self._drawdown(self.equity_peak, self.equity)
+        self.equity *= np.exp(pnl_delta + fees)
+        self.equity_peak = max(self.equity_peak, self.equity)
+        dd_after = self._drawdown(self.equity_peak, self.equity)
 
-        # 4) 변동성/정체 페널티: 수익 없는데 변동만 큰 구간에서 포지션 유지 페널티
-        self.vol_ewm = 0.9 * self.vol_ewm + 0.1 * abs(logret)  # 지수 가중 이동평균
-        flat_pen = -self.flat_coef * self.position * max(0.0, self.vol_ewm - self.vol_floor)
-
-        # 5) 과매매/행동단조 페널티(같은 액션 연속 K스텝 초과 시)
-        self.streak = self.streak + 1 if int(action) == self.last_action else 1
-        pen_streak = -self.streak_coef * max(0, self.streak - self.streak_hyst)
-        self.last_action = int(action)
-
-        # 6) 포지션 변경 페널티 (과매매 방지)
-        position_changed = int(target_pos != self.position)
-        pen_switch = -self.switch_coef * position_changed
-
-        # 7) 최종 보상
-        reward = reward_return + fee + pen_dd + flat_pen + pen_streak + pen_switch
+        # 4) 최종 보상 계산 (스케일링 + 클리핑)
+        reward = pnl_delta - fees - 0.3 * max(0.0, dd_after - dd_before)  # DD 증가 패널티
+        reward = float(np.clip(reward, -0.01, 0.01))  # 스케일/클립
+        
+        # 5) 에피소드 보상 추적
+        if not hasattr(self, 'episode_rewards'):
+            self.episode_rewards = []
+        self.episode_rewards.append(reward)
+        
+        # 6) 에피소드 종료 시 Sharpe 보너스
+        done = self.current_step >= len(self.df) - 2
+        if done and len(self.episode_rewards) > 10:
+            r = np.asarray(self.episode_rewards, dtype=np.float64)
+            sharpe = float(np.mean(r) / (np.std(r) + 1e-8)) * np.sqrt(24*365)  # 1h이면 24*365
+            reward += 0.01 * np.tanh(sharpe)
+        
+        self.prev_action = target_pos  # 다음 스텝을 위해 저장
         
         # 디버그용 변수들
-        trade_cost = fee
-        trade_flag = int(position_changed)
+        trade_cost = fees
+        trade_flag = int(target_pos != self.prev_action)
 
         self.current_step += 1
         if self.current_step >= len(self.df) - 2:
@@ -274,12 +295,19 @@ class TradingEnv(gym.Env):
             # 남은 길이가 최소 요구 길이보다 작지 않게 오프셋 클램프
             max_offset = max(self.window, self.length - required)
             offset = int(max(self.window, min(offset, max_offset)))
+            
+            # 시드가 있으면 약간의 랜덤성 추가 (최대 100 스텝)
+            if seed is not None:
+                np.random.seed(seed)
+                random_offset = np.random.randint(0, min(100, max_offset - offset))
+                offset += random_offset
+                offset = min(offset, max_offset)
         
         self.current_step = offset
         self.position = 0
         self.entry_price = None
         self.equity = 1.0
-        self.peak_equity = 1.0
+        self.equity_peak = 1.0
         self.prev_action = 0
         self.vol_ewm = 0.0
         self.streak = 0

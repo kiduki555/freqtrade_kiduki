@@ -1,0 +1,23 @@
+seed: 42
+
+data:
+  ohlcv_path: user_data/datasets/ohlcv.csv
+  asset: BTC/USDT
+
+split:
+  train_val_cut: "2024-06-01"
+
+tft:
+  enc_len: 64
+  hidden_size: 160
+  attention_heads: 4
+  dropout: 0.2
+  feature_cols: []   # auto-filled by script
+
+train:
+  batch_size: 128
+  num_workers: 0
+  max_epochs: 50
+  early_stop_patience: 8
+  lr: 1e-3
+  grad_clip: 1.0

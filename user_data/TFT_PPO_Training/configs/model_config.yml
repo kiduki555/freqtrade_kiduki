@@ -1,5 +1,6 @@
 seed: 42
 device: "cuda"
+timeframe: "1h"  # 데이터 타임프레임 명시
 
 data:
   path: "user_data/data/binance/BTC_USDT-1h.feather"
@@ -8,27 +9,40 @@ data:
   finetune_days: 180
 
 tft:
-  hidden_size: 64
-  attention_heads: 4
-  dropout: 0.1
-  learning_rate: 0.0001
+  hidden_size: 160
+  attention_heads: 6 
+  dropout: 0.25
+  learning_rate: 0.0005
+  min_lr: 0.00001  
+  lr_schedule: "cosine"  
   max_epochs: 100
-  batch_size: 64
-  encoder_length: 72
+  batch_size: 48  
+  encoder_length: 96
   early_stopping:
-    patience: 5
+    patience: 15  
     min_delta: 1e-6
   scheduler:
     factor: 0.5
-    patience: 2
-  grad_clip: 0.5
-  train_split: 0.85
+    patience: 3  
+  grad_clip: 1.0  
+  train_split: 0.9        
+  horizons: [24, 48, 96]  
+  loss_weights:
+    returns: 1.0      
+    direction: 0.5    
+    volatility: 0.25  
+  metrics:
+    - "r2_score"
+    - "correlation"
+    - "directional_auc"  
+    - "ic_top20"        
+    - "vol_calibration" 
 
 ppo:
-  learning_rate: 0.00003
+  learning_rate: 0.0001  # 학습률 증가
   gamma: 0.95
   clip_range: 0.2
-  ent_coef: 0.01
+  ent_coef: 0.05  # 엔트로피 계수 증가 (탐색 강화)
   batch_size: 512
   n_steps: 2048
   timesteps: 2000000
@@ -37,6 +51,15 @@ optuna:
   trials: 15
   timesteps: 200000
   direction: maximize
+
+# 속도 최적화 설정
+eval:
+  speed_mode: true
+  warmup_steps: 50000
+  every: 50000
+  max_steps: 400
+  episodes: 1
+  offsets: [0]
 
 logging:
   wandb_project: "TFT_PPO_Trader"
