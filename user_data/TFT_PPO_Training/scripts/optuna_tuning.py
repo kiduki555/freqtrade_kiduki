@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import math
+import inspect
+import pathlib
 from typing import Callable, Dict, Any
 
 import numpy as np
@@ -15,6 +17,18 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from TFT_PPO_modules.performance_metrics import performance_metrics  # (남겨둠: 필요시 사용)
 from TFT_PPO_modules.trading_env import TradingEnv                  # (타입 힌트 용도)
 from TFT_PPO_Training.scripts.utils import set_seed
+
+# =========================
+# TradingEnv 소스 검증 강화 (pathlib 기반)
+# =========================
+src = pathlib.Path(inspect.getsourcefile(TradingEnv)).resolve()
+print(f"[ENV-CHECK] TradingEnv from: {src}")
+
+# optuna_tuning.py 위치 기준 기대 경로 (CWD 무관)
+base = pathlib.Path(__file__).resolve().parents[2]  # .../user_data
+expected = (base / "TFT_PPO_modules" / "trading_env.py").resolve()
+if src != expected:
+    raise RuntimeError(f"Loaded WRONG TradingEnv: {src} (expected: {expected})")
 
 
 # =========================
@@ -121,12 +135,245 @@ def rolling_tft_encode(tft_model, X, win=96):
     return embs
 
 
+def _extract_trade(infos, as_delta=False, _state={"last": 0}):
+    """VecEnv/래퍼에서 trade 값 안전하게 추출 (per-step 플래그 대응)"""
+    v = 0
+    if isinstance(infos, (list, tuple)):
+        # DummyVecEnv: 첫 번째 info만 확인 (per-step 플래그)
+        for info in infos:
+            if isinstance(info, dict):
+                # 여러 키명 fallback 지원
+                if "trade" in info:
+                    v = int(info["trade"])
+                    break
+                elif "did_trade" in info:
+                    v = int(info["did_trade"])
+                    break
+                elif "trade_flag" in info:
+                    v = int(info["trade_flag"])
+                    break
+    elif isinstance(infos, dict):
+        # 여러 키명 fallback 지원
+        if "trade" in infos:
+            v = int(infos["trade"])
+        elif "did_trade" in infos:
+            v = int(infos["did_trade"])
+        elif "trade_flag" in infos:
+            v = int(infos["trade_flag"])
+    
+    if not as_delta:
+        return v
+    
+    # delta 모드: 이전 값과의 차이 반환 (누적 카운터 대응)
+    delta = max(0, v - _state["last"])
+    _state["last"] = v
+    return delta
+
+
+def _as_scalar(x):
+    """배열을 스칼라로 안전하게 변환"""
+    arr = np.array(x)
+    return float(arr.reshape(-1)[0])
+
+
+def _as_bool(x):
+    """배열을 bool로 안전하게 변환"""
+    arr = np.array(x)
+    return bool(arr.reshape(-1)[0])
+
+
+def _audit_env(ev):
+    """평가 환경 정상 작동 확인 (VecEnv API 안전 처리)"""
+    out = ev.reset()
+    obs = out[0] if isinstance(out, tuple) else out
+    
+    acts = [1, 2] * 10  # long/short 번갈아
+    pos_rewards = 0
+    trades = 0
+    
+    for a in acts:
+        a_in = [a] if hasattr(ev, "num_envs") else a
+        ret = ev.step(a_in)
+        
+        # Gymnasium API: (obs, reward, terminated, truncated, infos)
+        if len(ret) == 5:
+            obs, r, term, trunc, infos = ret
+            done = _as_bool(term) or _as_bool(trunc)
+        else:
+            obs, r, done, infos = ret  # 구버전 호환
+            done = _as_bool(done)
+        
+        pos_rewards += int(_as_scalar(r) > 0)
+        trades += _extract_trade(infos)
+        
+        if done:
+            break
+    
+    print(f"[AUDIT] pos_rewards={pos_rewards} trades={trades}")
+    
+    if trades < 5:
+        raise ValueError(f"Audit failed: trades={trades}<5 (info lost or filter too strict)")
+    if pos_rewards < 1:
+        raise ValueError(f"Audit failed: no positive rewards (wrong reward config)")
+    
+    print(f"[AUDIT] SUCCESS: Environment is working correctly")
+    # 감사 후 환경 리셋
+    ev.reset()
+    return True
+
+
+def _probe_eval_pipeline(main_config=None, df_ppo=None, tft_model=None, feature_pipeline=None, env_fn=None):
+    """평가 파이프라인 검증 (모델 없이 강제 액션으로)"""
+    print("[Probe] Starting evaluation pipeline probe...")
+    
+    # 간단한 평가용 환경 생성
+    from stable_baselines3.common.vec_env import DummyVecEnv
+    from stable_baselines3.common.vec_env import VecNormalize
+    
+    # 기본 환경 생성 (offset=0)
+    trial_seed = (main_config.get("seed", 42) if main_config else 42) + 999  # 테스트용 시드
+    if df_ppo is not None and feature_pipeline is not None and tft_model is not None:
+        env = make_env_with_offset(df_ppo, tft_model, feature_pipeline.features, offset=0)()
+    elif env_fn is not None:
+        env = env_fn()
+    else:
+        print("[Probe] WARNING: No environment factory available, skipping probe")
+        return False
+    
+    # 평가용 파라미터 설정
+    if hasattr(env, "reward_mode"):    env.reward_mode = "pnl_delta"
+    if hasattr(env, "fee_rate"):       env.fee_rate = 3 / 1e4
+    if hasattr(env, "slippage_rate"):  env.slippage_rate = 1 / 1e4
+    if hasattr(env, "sanity_mode"):    env.sanity_mode = False
+    
+    from gymnasium.wrappers import TimeLimit
+    eval_steps = (main_config.get("eval", {}).get("max_steps", 1000) if main_config else 1000)
+    env = TimeLimit(env, max_episode_steps=int(eval_steps))
+    env.reset(seed=trial_seed)
+    
+    # VecEnv로 래핑
+    ev = DummyVecEnv([lambda: env])
+    ev = VecNormalize(ev, norm_obs=True, norm_reward=False, clip_obs=5.0, clip_reward=float("inf"))
+    ev.training = False
+    ev.norm_reward = False
+    
+    obs = ev.reset()[0]
+    trades = 0
+    
+    for i in range(30):
+        a = np.array([1 if i%2==0 else 2], dtype=np.int64)  # 1,2 번갈아
+        obs, reward, dones, infos = ev.step(a)
+        t = _extract_trade(infos)
+        info0 = infos[0] if isinstance(infos, (list, tuple)) and len(infos)>0 else infos
+        print(f"[Probe] i={i} forced_action={a[0]} trade={t} info_keys={list(info0.keys()) if isinstance(info0, dict) else type(info0)}")
+        trades += t
+        if bool(dones[0]): 
+            break
+    
+    ev.close()
+    print(f"[Probe] total_trades={trades}")
+    
+    if trades > 0:
+        print("[Probe] SUCCESS: Pipeline is working, trades detected")
+    else:
+        print("[Probe] FAILED: No trades detected in pipeline")
+    
+    return trades > 0
+
+
 def max_drawdown_equity(eq):
     """에쿼티 시계열에서 최대 드로우다운 계산"""
     eq = np.asarray(eq, dtype=float)
     peak = np.maximum.accumulate(eq)
     dd = (peak - eq) / np.maximum(peak, 1e-9)
     return float(np.max(dd)) if dd.size else 0.0
+
+
+import gymnasium as gym
+import numpy as np
+
+class NoOpStreakPenaltyWrapper(gym.Wrapper):
+    def __init__(self, env, patience=5, penalty=1e-4, max_penalty=5e-4):
+        super().__init__(env)
+        self.patience = patience
+        self.penalty = penalty
+        self.max_penalty = max_penalty
+        self._streak = 0
+
+    def reset(self, **kwargs):
+        self._streak = 0
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        # SB3 Discrete: 0=hold 가정
+        a = int(action[0] if isinstance(action, (list, np.ndarray)) else action)
+        if a == 0:
+            self._streak += 1
+            if self._streak >= self.patience:
+                # 페널티는 누진(상한 캡)
+                p = min(self.penalty * (self._streak - self.patience + 1), self.max_penalty)
+                reward = float(reward) - p
+                info["noop_penalty"] = p
+        else:
+            self._streak = 0
+        return obs, reward, terminated, truncated, info
+
+
+# === PnL 기반 평가 헬퍼 ===
+def _extract_pnl(infos):
+    # VecEnv일 수 있어 list/tuple 방어
+    if isinstance(infos, (list, tuple)):
+        for d in infos:
+            if isinstance(d, dict):
+                if "pnl_step" in d: return float(d["pnl_step"])
+                if "pnl" in d:      return float(d["pnl"])  # 백업
+        return 0.0
+    if isinstance(infos, dict):
+        return float(infos.get("pnl_step", infos.get("pnl", 0.0)))
+    return 0.0
+
+def _equity_from_pnl_series(pnl_series, start_equity=1.0):
+    # pnl_step은 로그수익 가정 → equity = exp(cumsum)
+    pnl = np.asarray(pnl_series, dtype=np.float64)
+    return start_equity * np.exp(np.cumsum(pnl))
+
+def _sharpe_from_pnl(pnl_series, steps_per_year=24*365, eps=1e-12):
+    r = np.asarray(pnl_series, dtype=np.float64)
+    mu, sd = float(np.mean(r)), float(np.std(r))
+    if sd < eps: 
+        return 0.0
+    return float((mu / sd) * np.sqrt(steps_per_year))
+
+# === 스마트 거래 카운터 헬퍼 ===
+def _trade_counter_begin():
+    """거래 카운터 상태 리셋"""
+    _extract_trade.__defaults__ = (False, {"last": 0})
+
+def _trade_count_smart(infos):
+    """
+    trade 플래그/카운터 자동 판별:
+    - 우선 델타 시도(카운터 가정)
+    - 델타가 0이고 플래그가 1이면(=카운터 아님) 플래그를 합산
+    """
+    # raw flag
+    raw = _extract_trade(infos, as_delta=False)
+    # delta (counter 가정)
+    delta = _extract_trade(infos, as_delta=True)
+    if delta > 0:
+        return delta
+    # delta=0인데 raw=1 이면 per-step flag로 간주
+    return 1 if raw == 1 else 0
+def _score_from_kpis(sharpe, mdd, trades):
+    """점수 계산 함수 - 현실적인 범위로 수정"""
+    if trades == 0:   return -2.0
+    if trades < 3:    return -1.6
+    if trades < 5:    return -1.3
+
+    # 샤프↑(0.6), MDD↓(-1.5), 거래 소량 보너스(+0.1)
+    score = 0.6*sharpe - 1.5*mdd + 0.1*min(trades, 50)/50.0
+    # 과매매(스텝 대비 거래 비중) 완만 패널티를 원하면 여기서 조정
+    return float(np.clip(score, -2.0, 3.0))
 
 
 # =========================
@@ -294,23 +541,42 @@ def tune_ppo(
         import os, time
         print(f"[DEBUG] using optuna_tuning.py at {__file__} mtime={time.ctime(os.path.getmtime(__file__))}")
 
+        # 정책 네트워크 강제 재초기화 함수 정의
+        def _force_policy_reinit(model):
+            """정책 네트워크를 완전히 재초기화하는 함수"""
+            import torch
+            import torch.nn as nn
+            
+            # 정책 네트워크의 모든 가중치를 재초기화
+            for module in model.policy.modules():
+                if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+                elif isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                    nn.init.ones_(module.weight)
+                    nn.init.zeros_(module.bias)
+            
+            print("[PolicyReinit] Policy network weights completely reinitialized")
+            return model
+
         # 1) 탐색공간 & 안전 클램프
         params = _suggest_params(trial, ocfg["search_space"])
-        # SB3 일반 권장 범위에 맞춰 보수적으로 (탐색 과잉 방지)
-        params["ent_coef"] = float(np.clip(params.get("ent_coef", 0.0), 0.0, 0.05))
+        # 탐색 안정화를 위해 상한 조정
+        params["ent_coef"] = float(np.clip(params.get("ent_coef", 0.0), 0.002, 0.03))  # 정상 범위로 복원
         params["clip_range"] = float(np.clip(params.get("clip_range", 0.2), 0.10, 0.25))
-        params["gamma"] = float(np.clip(params.get("gamma", 0.99), 0.98, 0.995))  # 감마 범위 현실적으로 조정
+        params["gamma"] = float(np.clip(params.get("gamma", 0.99), 0.98, 0.992))  # 감마 범위 현실적으로 조정
         params["batch_size"] = int(params.get("batch_size", 256))
         print(f"[PARAM-OVERRIDE] ent_coef={params['ent_coef']:.4f} clip_range={params['clip_range']:.2f} gamma={params['gamma']:.3f} batch={params['batch_size']}")
 
         print("[Optuna] TFT embedding cache disabled for trial diversity")
 
-        # 2) PPO kwargs
+        # 2) PPO kwargs (스케줄은 학습 중에 동적으로 조정)
         ppo_kwargs = dict(
             learning_rate=params["learning_rate"],
             gamma=params["gamma"],
             clip_range=params["clip_range"],
-            ent_coef=params["ent_coef"],
+            ent_coef=0.07,  # 🔼 초기값을 높게 설정 (학습 중 동적 조정)
             batch_size=params["batch_size"],
             vf_coef=params.get("vf_coef", 0.5),
             max_grad_norm=params.get("max_grad_norm", 1.0),
@@ -318,12 +584,22 @@ def tune_ppo(
             verbose=0,
             seed=main_config.get("seed", 42),
             n_steps=main_config["ppo"].get("n_steps", 2048),
+            target_kl=0.015,                         # 🔒 쏠림 가속 업데이트 컷
         )
 
         # 3) 학습용 VecNormalize + StickyAction + MinHoldCooldown 적용
         def make_trial_env():
             trial_seed = main_config.get("seed", 42) + trial.number
             env = env_fn(trial_seed=trial_seed)  # 사용자가 넘기는 TradingEnv factory
+            
+            # 환경 설정 검증 및 로깅 (래퍼 전에)
+            if hasattr(env, 'reward_mode'):
+                print(f"[ENV-PARAMS] reward_mode={env.reward_mode}")
+                assert env.reward_mode == "pnl_delta", f"Wrong reward_mode: {env.reward_mode}"
+            
+            if hasattr(env, 'fee_rate'):
+                print(f"[ENV-PARAMS] fee_rate={env.fee_rate}")
+                assert abs(env.fee_rate - 0.00015) < 1e-6, f"Wrong fee_rate: {env.fee_rate}"
             
             # ⚙️ 환경 생성 시 옵션 강제 통일: 보상/비용/모드
             env.reward_mode = "pnl_delta"
@@ -332,18 +608,63 @@ def tune_ppo(
             if hasattr(env, "sanity_mode"):
                 env.sanity_mode = False  # 학습은 False로
             
-            env = StickyActionWrapper(env, prob=0.25)
-            # 액션 안정화를 위한 최소 보유시간 + 쿨다운 래퍼 추가
+            # TimeLimit 래핑 (래퍼 전에)
+            from gymnasium.wrappers import TimeLimit
+            eval_steps = main_config.get("eval", {}).get("max_steps", 1000)
+            env = TimeLimit(env, max_episode_steps=int(eval_steps))
+            
+            # Sticky/ActionFilter는 평가에서 비활성화 (정량 비교 목적)
+            # 훈련에서는 탐색을 위해 더 공격적으로 활성화
+            env = StickyActionWrapper(env, prob=0.15)  # 0.4 → 0.15로 완화
+            
+            # MinHoldCooldown은 유지 (과매매 방지)
             from TFT_PPO_Training.scripts.wrappers import MinHoldCooldownWrapper
-            env = MinHoldCooldownWrapper(env, min_hold=3, cooldown=2)  # 과매매 방지 완화
+            env = MinHoldCooldownWrapper(env, min_hold=3, cooldown=2)
+            
+            # 새로 추가: 안정화된 탐색 강화 래퍼들 (훈련 전용)
+            from TFT_PPO_Training.scripts.wrappers import EpsGreedyWrapper, SameActionPenaltyWrapper
+            # ActionCycleWrapper는 잠정 비활성화 (학습 신호 왜곡 큼)
+            # env = ActionCycleWrapper(env, cycle_length=100)
+            
+            # StickyAction 제거 (쏠림 유지기 역할)
+            # env = StickyActionWrapper(env, prob=0.15)  # ❌ 제거
+            
+            # 순서: (탐색) → (반복벌) → (대기연속벌)
+            env = EpsGreedyWrapper(env, eps=0.20)  # 0.15 → 0.20 (초기만 살짝 올려 탐색 확보)
+            env = SameActionPenaltyWrapper(env, penalty=1e-4)  # 3e-5 → 1e-4 (반복 억제 강화)
+            env = NoOpStreakPenaltyWrapper(env, patience=5, penalty=1e-4, max_penalty=5e-4)  # 대기연속벌
+            
             if hasattr(env, "reset"):
                 env.reset(seed=trial_seed)
             return env
 
+        def make_eval_env():
+            trial_seed = main_config.get("seed", 42) + trial.number
+            env = env_fn(trial_seed=trial_seed)  # 사용자가 넘긴 순수 TradingEnv 팩토리
+            # 평가용 공통 파라미터 통일
+            if hasattr(env, "reward_mode"):    env.reward_mode = "pnl_delta"
+            if hasattr(env, "fee_rate"):       env.fee_rate = 3 / 1e4
+            if hasattr(env, "slippage_rate"):  env.slippage_rate = 1 / 1e4
+            if hasattr(env, "sanity_mode"):    env.sanity_mode = False
+            
+            # 평가에서는 순수한 정책 성능 측정 (ε-greedy 제거)
+            # from TFT_PPO_Training.scripts.wrappers import EpsGreedyWrapper
+            # env = EpsGreedyWrapper(env, eps=0.05)  # 평가용으로 더 낮은 확률
+            
+            from gymnasium.wrappers import TimeLimit
+            eval_steps = main_config.get("eval", {}).get("max_steps", 1000)
+            env = TimeLimit(env, max_episode_steps=int(eval_steps))
+            env.reset(seed=trial_seed)
+            return env
+
         venv = DummyVecEnv([make_trial_env])
-        venv = VecNormalize(venv, norm_obs=True, norm_reward=True, clip_obs=5.0, clip_reward=10.0)
+        venv = VecNormalize(venv, norm_obs=True, norm_reward=False, clip_obs=5.0, clip_reward=float("inf"))
 
         model = PPO("MlpPolicy", venv, **ppo_kwargs)
+        
+        # 정책 네트워크 강제 재초기화 (매 Trial마다)
+        model = _force_policy_reinit(model)
+        
         if hasattr(model.policy, "reset_parameters"):
             model.policy.reset_parameters()
         print(f"[Optuna] Trial {trial.number} - PPO model initialized with fresh weights")
@@ -355,73 +676,100 @@ def tune_ppo(
         speed_mode = eval_config.get("speed_mode", True)
         eval_warmup_steps = max(100_000, eval_config.get("warmup_steps", 100_000))  # 최소 100k
         eval_every = eval_config.get("every", 50_000)
-        eval_max_steps = eval_config.get("max_steps", 1000)   # ← 1000으로 증가
+        eval_max_steps = eval_config.get("max_steps", 2000)   # ← 2000으로 증가
         eval_episodes = eval_config.get("episodes", 2)        # ← 2개 에피소드로 증가
-        eval_offsets = eval_config.get("offsets", [0, 800])   # ← 서로 다른 시작점 2개
+        eval_offsets = eval_config.get("offsets", [0, 800, 1600])   # ← 서로 다른 시작점 3개
 
         # 평가용 VecNormalize venv 생성자 (학습 통계 공유)
         def _make_eval_venv():
-            e = DummyVecEnv([make_trial_env])
-            ev = VecNormalize(e, norm_obs=True, norm_reward=True, clip_obs=5.0, clip_reward=10.0)
+            e = DummyVecEnv([make_eval_env])  # ★ 래퍼 없는 평가용
+            ev = VecNormalize(e, norm_obs=True, norm_reward=False, clip_obs=5.0, clip_reward=float("inf"))
             ev.obs_rms = venv.obs_rms
             ev.ret_rms = venv.ret_rms
             ev.training = False
             ev.norm_reward = False
-            
-            # ⚙️ 평가 환경도 동일한 옵션 적용
-            for env in ev.envs:
-                if hasattr(env, 'env'):
-                    env = env.env
-                env.reward_mode = "pnl_delta"
-                env.fee_rate = 3 / 1e4  # fee_bps=3
-                env.slippage_rate = 1 / 1e4  # slippage_bps=1
-                if hasattr(env, "sanity_mode"):
-                    env.sanity_mode = False
-            
             return ev
 
         def _evaluate_with_vecnorm(model, steps=1000) -> float:
             ev = _make_eval_venv()
-            # TimeLimit: VecNormalize 내부 env에 적용 (reset 전에)
-            from gymnasium.wrappers import TimeLimit
-            if not isinstance(ev.envs[0], TimeLimit):
-                ev.envs[0] = TimeLimit(ev.envs[0], max_episode_steps=int(steps))
+
+            # 첫 평가 시 감사
+            if not hasattr(_evaluate_with_vecnorm, '_audited'):
+                _audit_env(ev)
+                _probe_eval_pipeline(main_config, df_ppo, tft_model, feature_pipeline, env_fn)  # 파이프라인 검증 추가
+                _evaluate_with_vecnorm._audited = True
+
             obs = ev.reset()[0]
-            rewards, done = [], False
-            trade_count = 0
+            
+            # 거래 카운트 상태 리셋 (스마트 집계용)
+            _trade_counter_begin()
+            
+            pnl_list, rewards, trade_count = [], [], 0
+            done = False
+
             while not done:
-                action, _ = model.predict(obs, deterministic=True)
-                # DummyVecEnv는 배열을 기대하므로 액션을 배열로 감싸기
-                if not isinstance(action, (list, np.ndarray)) or (isinstance(action, np.ndarray) and action.ndim == 0):
-                    action = [action]
-                elif isinstance(action, np.ndarray) and action.ndim == 1 and len(action) == 1:
-                    action = action.tolist()
+                action, _ = model.predict(obs, deterministic=True)   # ★ 결정적
+                # 안전 포장: (1,) 형태의 int64 보장
+                if isinstance(action, np.ndarray):
+                    if action.ndim == 0:
+                        action = action.reshape(1,)
+                    elif action.ndim > 1:
+                        action = action.squeeze()
+                else:
+                    action = np.array([action])
+                action = action.astype(np.int64)
                 obs, reward, dones, infos = ev.step(action)
                 done = bool(dones[0])
-                rewards.append(float(reward[0]))
+                rewards.append(float(reward[0]))                     # 로깅용
+                pnl_list.append(_extract_pnl(infos))                 # ★ 평가 핵심
+                trade_count += _extract_trade(infos)                 # 플래그 합산 (as_delta=False)
                 
-                # ✨ 환경 info에서 실제 거래수 합산 (VecNormalize 환경 고려)
-                if isinstance(infos, (list, tuple)) and len(infos) > 0:
-                    info = infos[0]
-                    if isinstance(info, dict):
-                        trade_flag = int(info.get("trade", 0))
-                        trade_count += trade_flag
-                        if trade_flag > 0:  # 디버깅용
-                            print(f"[DEBUG] Trade detected: {trade_flag}")
-                    elif hasattr(info, 'get'):
-                        trade_flag = int(info.get("trade", 0))
-                        trade_count += trade_flag
-                        if trade_flag > 0:  # 디버깅용
-                            print(f"[DEBUG] Trade detected: {trade_flag}")
+                # 디버그 로그 (200스텝마다)
+                if len(pnl_list) % 200 == 0:
+                    print(f"[StepDbg] t={len(pnl_list)} trade+={_extract_trade(infos)} total_trades={trade_count}")
+
             ev.close()
-            return _score_rewards(rewards, freq=data_freq, trades_override=trade_count)
+
+            equity = _equity_from_pnl_series(pnl_list, start_equity=1.0)
+            mdd = max_drawdown_equity(equity)
+            sharpe = _sharpe_from_pnl(pnl_list, steps_per_year=24*365)
+            winrate = float(np.mean(np.array(pnl_list) > 0.0))
+            final = _score_from_kpis(sharpe, mdd, trade_count)
+
+            print(f"[EvalKPIs] len={len(pnl_list)} trades={trade_count} sharpe={sharpe:.3f} winrate={winrate:.3f} mdd={mdd:.3f}")
+            print(f"[EvalStats] reward: mean={np.mean(rewards):.6f} std={np.std(rewards):.6f} min={np.min(rewards):.6f} max={np.max(rewards):.6f}")
+            print(f"[EvalStats] pnl   : mean={np.mean(pnl_list):.6f} std={np.std(pnl_list):.6f} min={np.min(pnl_list):.6f} max={np.max(pnl_list):.6f}")
+            print(f"[EvalScore] final_score={final:.6f} (sharpe={sharpe:.3f}, mdd={mdd:.3f}, trades={trade_count})")
+            return final
 
         learned = 0
         best_score = -np.inf
         print(f"[Optuna] Trial {trial.number} start | total_ts={total_ts} | speed_mode={speed_mode} | params={params}")
 
         while learned < total_ts:
+            # ε-greedy 스케줄: 초반만 세게, 이후 급감
+            if learned < 60_000:
+                try: venv.envs[0].env.env.set_eps(0.30)  # 0.15 → 0.30 (초반만 강탐색)
+                except: pass
+            elif learned < 120_000:
+                try: venv.envs[0].env.env.set_eps(0.10)
+                except: pass
+            else:
+                try: venv.envs[0].env.env.set_eps(0.05)
+                except: pass
+            
             chunk = min(10_000, total_ts - learned)
+            
+            # ent_coef 동적 조정 (스케줄 적용)
+            progress = learned / total_ts
+            remaining = 1.0 - progress
+            if remaining > 0.5:  # 초기 50% 구간
+                model.ent_coef = 0.07
+            elif remaining > 0.2:  # 중기 30% 구간
+                model.ent_coef = 0.04
+            else:  # 후기 20% 구간
+                model.ent_coef = 0.012
+            
             model.learn(total_timesteps=chunk, reset_num_timesteps=False, progress_bar=False)
             learned += chunk
             print(f"[Optuna] Trial {trial.number} learned {learned}/{total_ts} timesteps ({learned/total_ts*100:.1f}%)")
@@ -437,88 +785,124 @@ def tune_ppo(
             if speed_mode:
                 scores = []
                 for offset in eval_offsets:
-                    # 오프셋별 환경 생성 (df_ppo와 feature_pipeline이 있는 경우에만)
-                    if df_ppo is not None and feature_pipeline is not None:
-                        def make_offset_env():
-                            trial_seed = main_config.get("seed", 42) + trial.number
+                    def make_offset_eval_env(offset):
+                        trial_seed = main_config.get("seed", 42) + trial.number
+                        if df_ppo is not None and feature_pipeline is not None:
                             env = make_env_with_offset(df_ppo, tft_model, feature_pipeline.features, offset)()
-                            env = StickyActionWrapper(env, prob=0.25)
-                            from TFT_PPO_Training.scripts.wrappers import MinHoldCooldownWrapper
-                            env = MinHoldCooldownWrapper(env, min_hold=3, cooldown=2)  # 과매매 방지 완화
-                            if hasattr(env, "reset"):
-                                env.reset(seed=trial_seed)
-                            return env
-                    else:
-                        # 기존 방식 사용
-                        def make_offset_env():
-                            trial_seed = main_config.get("seed", 42) + trial.number
+                        else:
                             env = env_fn()
-                            
-                            # ⚙️ 환경 생성 시 옵션 강제 통일: 보상/비용/모드
-                            env.reward_mode = "pnl_delta"
-                            env.fee_rate = 3 / 1e4  # fee_bps=3
-                            env.slippage_rate = 1 / 1e4  # slippage_bps=1
-                            if hasattr(env, "sanity_mode"):
-                                env.sanity_mode = False
-                            
-                            env = StickyActionWrapper(env, prob=0.25)
-                            from TFT_PPO_Training.scripts.wrappers import MinHoldCooldownWrapper
-                            env = MinHoldCooldownWrapper(env, min_hold=3, cooldown=2)  # 과매매 방지 완화
-                            if hasattr(env, "reset"):
-                                env.reset(seed=trial_seed)
-                            return env
-                    
-                    # 오프셋별 평가용 환경 생성
-                    def _make_offset_eval_venv():
-                        e = DummyVecEnv([make_offset_env])
-                        ev = VecNormalize(e, norm_obs=True, norm_reward=True, clip_obs=5.0, clip_reward=10.0)
+                        if hasattr(env, "reward_mode"):    env.reward_mode = "pnl_delta"
+                        if hasattr(env, "fee_rate"):       env.fee_rate = 3 / 1e4
+                        if hasattr(env, "slippage_rate"):  env.slippage_rate = 1 / 1e4
+                        if hasattr(env, "sanity_mode"):    env.sanity_mode = False
+                        
+                        # 평가에서는 순수한 정책 성능 측정 (ε-greedy 제거)
+                        # from TFT_PPO_Training.scripts.wrappers import EpsGreedyWrapper
+                        # env = EpsGreedyWrapper(env, eps=0.05)
+                        
+                        from gymnasium.wrappers import TimeLimit
+                        eval_steps = main_config.get("eval", {}).get("max_steps", 1000)
+                        env = TimeLimit(env, max_episode_steps=int(eval_steps))
+                        env.reset(seed=trial_seed)
+                        return env
+
+                    def _make_offset_eval_venv(offset):
+                        e = DummyVecEnv([lambda: make_offset_eval_env(offset)])
+                        ev = VecNormalize(e, norm_obs=True, norm_reward=False, clip_obs=5.0, clip_reward=float("inf"))
                         ev.obs_rms = venv.obs_rms
                         ev.ret_rms = venv.ret_rms
                         ev.training = False
                         ev.norm_reward = False
                         return ev
-                    
-                    def _evaluate_offset(model, steps=eval_max_steps) -> float:
-                        ev = _make_offset_eval_venv()
-                        # TimeLimit: VecNormalize 내부 env에 적용 (reset 전에)
-                        from gymnasium.wrappers import TimeLimit
-                        if not isinstance(ev.envs[0], TimeLimit):
-                            ev.envs[0] = TimeLimit(ev.envs[0], max_episode_steps=int(steps))
+
+                    def _evaluate_offset(model, offset, steps):
+                        ev = _make_offset_eval_venv(offset)
                         obs = ev.reset()[0]
-                        rewards, done = [], False
-                        trade_count = 0
+                        
+                        # 거래 카운트 상태 리셋 (스마트 집계용)
+                        _trade_counter_begin()
+                        
+                        pnl_list, rewards, trade_count, done = [], [], 0, False
+                        epsilon_probe_used = False
+                        
+                        # 디버깅 변수들
+                        step_i = 0
+                        act_hist = {0:0, 1:0, 2:0}
+                        trade_ones = 0
+                        
                         while not done:
                             action, _ = model.predict(obs, deterministic=True)
-                            # DummyVecEnv는 배열을 기대하므로 액션을 배열로 감싸기
-                            if not isinstance(action, (list, np.ndarray)) or (isinstance(action, np.ndarray) and action.ndim == 0):
-                                action = [action]
-                            elif isinstance(action, np.ndarray) and action.ndim == 1 and len(action) == 1:
-                                action = action.tolist()
+                            
+                            # 정책 분포 진단 (200스텝 간격)
+                            if len(pnl_list) % 200 == 0:
+                                try:
+                                    dist = model.policy.get_distribution(obs)
+                                    probs = getattr(dist.distribution, "probs", None)
+                                    if probs is not None:
+                                        p = probs[0].detach().cpu().numpy()
+                                        if len(p) == 3:
+                                            print(f"[PiProbs] t={len(pnl_list)} p(a0,a1,a2)={p[0]:.3f},{p[1]:.3f},{p[2]:.3f}")
+                                except:
+                                    pass
+                            
+                            # --- ε-probe: 결정적 정책이 trades를 못 만들 때만 가끔 찔러봄 ---
+                            if trade_count < 3 and np.random.rand() < 0.05:
+                                # action 공간이 Discrete(3)라고 가정: 0,1,2 중에서 무작위
+                                action = np.array([np.random.randint(0, 3)], dtype=np.int64)
+                                epsilon_probe_used = True
+                            # -------------------------------------------------------------
+                            
+                            # 안전 포장: (1,) 형태의 int64 보장
+                            if isinstance(action, np.ndarray):
+                                if action.ndim == 0:
+                                    action = action.reshape(1,)
+                                elif action.ndim > 1:
+                                    action = action.squeeze()
+                            else:
+                                action = np.array([action])
+                            action = action.astype(np.int64)
+                            
                             obs, reward, dones, infos = ev.step(action)
                             done = bool(dones[0])
-                            rewards.append(float(reward[0]))
                             
-                            # ✨ 환경 info에서 실제 거래수 합산
-                            if isinstance(infos, (list, tuple)) and len(infos) > 0 and isinstance(infos[0], dict):
-                                trade_count += int(infos[0].get("trade", 0))
+                            # 디버깅 정보 수집 (실제 환경에 전달된 액션 카운트)
+                            # action은 이미 환경에 전달된 후이므로 실제 액션임
+                            a0 = int(action[0])
+                            act_hist[a0] = act_hist.get(a0, 0) + 1
+                            
+                            t = _extract_trade(infos)
+                            if t > 0:
+                                trade_ones += 1
+                            
+                            rewards.append(float(reward[0]))
+                            pnl_list.append(_extract_pnl(infos))
+                            trade_count += _trade_count_smart(infos)  # 스마트 집계
+                            
+                            step_i += 1
                         ev.close()
-                        return _score_rewards(rewards, freq=data_freq, trades_override=trade_count)
-                    
-                    score = _evaluate_offset(model, steps=eval_max_steps)
+                        print(f"[ActionHist] {act_hist} | trade_ones_in_first={trade_ones}")
+                        
+                        equity = _equity_from_pnl_series(pnl_list, start_equity=1.0)
+                        mdd = max_drawdown_equity(equity)
+                        sharpe = _sharpe_from_pnl(pnl_list, steps_per_year=24*365)
+                        score = _score_from_kpis(sharpe, mdd, trade_count)
+                        
+                        print(f"[OffsetEval] offset={offset} len={len(pnl_list)} trades={trade_count} sharpe={sharpe:.3f} mdd={mdd:.3f} score={score:.6f} probe_used={epsilon_probe_used}")
+                        return score
+
+                    score = _evaluate_offset(model, offset, steps=eval_max_steps)
                     scores.append(score)
                 
                 # 여러 오프셋의 평균 점수 사용
                 score = float(np.mean(scores))
+                print(f"[MultiOffset] scores={[f'{s:.3f}' for s in scores]} -> avg_score={score:.6f}")
             else:
                 # 더 정확한 평가가 필요하면 아래를 확장
                 score = _evaluate_with_vecnorm(model, steps=eval_max_steps * 2)
 
             trial.report(score, step=learned)
             print(f"[Optuna] Trial {trial.number} evaluation: score={score:.6f} at step={learned}")
-            print(
-                f"[Optuna] Trial {trial.number} params: "
-                f"lr={params['learning_rate']:.2e}, gamma={params['gamma']:.3f}, ent_coef={params['ent_coef']:.4f}"
-            )
+            print(f"[Optuna] Trial {trial.number} params: lr={params.get('learning_rate', 0):.2e}, gamma={params.get('gamma', 0):.3f}, ent_coef={params.get('ent_coef', 0):.4f}")
 
             if score > best_score:
                 best_score = score

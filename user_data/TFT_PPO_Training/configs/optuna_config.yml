@@ -17,9 +17,9 @@ optuna:
     reduction_factor: 3
   search_space:
     learning_rate: { type: "loguniform", low: 1.0e-5, high: 5.0e-4 }
-    gamma:         { type: "uniform",    low: 0.985,  high: 0.999 }
+    gamma:         { type: "uniform",    low: 0.980,  high: 0.992 }
     clip_range:    { type: "uniform",    low: 0.10,   high: 0.30 }
-    ent_coef:      { type: "loguniform", low: 1.0e-5, high: 5.0e-2 }
+    ent_coef:      { type: "loguniform", low: 2.0e-3, high: 3.0e-2 }
     batch_size:    { type: "categorical", choices: [256, 512, 1024] }
     vf_coef:       { type: "uniform",    low: 0.5,    high: 1.2 }
     max_grad_norm: { type: "uniform",    low: 0.3,   high: 1.0 }

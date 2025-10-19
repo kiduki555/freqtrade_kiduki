@@ -112,3 +112,61 @@ class PriceTapWrapper(gym.Wrapper):
                 except Exception:
                     pass
         return None
+
+
+class EpsGreedyWrapper(gym.Wrapper):
+    """ε-greedy 액션 선택 래퍼 (훈련 전용)"""
+    def __init__(self, env, eps=0.10):
+        super().__init__(env)
+        self.eps = eps
+    
+    def step(self, action):
+        if np.random.rand() < self.eps:
+            action = self.action_space.sample()
+        return self.env.step(action)
+
+
+class ActionCycleWrapper(gym.Wrapper):
+    """액션 순환을 강제하여 단일 액션 고착을 방지하는 래퍼"""
+    def __init__(self, env, cycle_length=100):  # 더 긴 순환
+        super().__init__(env)
+        self.cycle_length = cycle_length
+        self.step_count = 0
+        # 더 균등한 순환: 각 액션을 동일하게 반복
+        self.forced_cycle = []
+        for i in range(cycle_length):
+            self.forced_cycle.append(i % 3)  # 0,1,2를 균등하게 반복
+        
+    def reset(self, **kwargs):
+        self.step_count = 0
+        return self.env.reset(**kwargs)
+    
+    def step(self, action):
+        # 처음 cycle_length 스텝은 강제 순환
+        if self.step_count < self.cycle_length:
+            forced_action = self.forced_cycle[self.step_count]
+            obs, reward, terminated, truncated, info = self.env.step(forced_action)
+            self.step_count += 1
+            return obs, reward, terminated, truncated, info
+        else:
+            # 이후에는 정상 액션 사용
+            return self.env.step(action)
+
+
+class SameActionPenaltyWrapper(gym.Wrapper):
+    """같은 액션 반복 시 미세 페널티 (훈련 전용)"""
+    def __init__(self, env, penalty=1e-5):
+        super().__init__(env)
+        self.penalty = penalty
+        self._prev_action = None
+    
+    def reset(self, **kwargs):
+        self._prev_action = None
+        return self.env.reset(**kwargs)
+    
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        if self._prev_action is not None and int(action) == int(self._prev_action):
+            reward = float(reward) - self.penalty
+        self._prev_action = int(action)
+        return obs, reward, terminated, truncated, info

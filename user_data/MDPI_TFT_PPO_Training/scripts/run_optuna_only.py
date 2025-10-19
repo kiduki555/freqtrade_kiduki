@@ -284,12 +284,19 @@ def run_ppo_only(
     
     df_ppo = df[df["date"] >= cutoff].copy()
     
+    # 평가용 고정 구간 (trial 무관)
+    eval_df = df_ppo.tail(4000).reset_index(drop=True)
+    
+    # 학습/튜닝용 (trial별 변동 가능)
+    train_df = df_ppo.iloc[:-4000].reset_index(drop=True)
+    
     # PPO용 최근 데이터 제한 (finetune_days)
     if config["data"]["finetune_days"] > 0:
-        cut_date = df_ppo["date"].max() - pd.Timedelta(days=config["data"]["finetune_days"])
-        df_ppo = df_ppo[df_ppo["date"] >= cut_date].reset_index(drop=True)
+        cut_date = train_df["date"].max() - pd.Timedelta(days=config["data"]["finetune_days"])
+        train_df = train_df[train_df["date"] >= cut_date].reset_index(drop=True)
     
-    print(f"PPO training data: {len(df_ppo)} samples")
+    print(f"PPO training data: {len(train_df)} samples")
+    print(f"PPO evaluation data: {len(eval_df)} samples")
     
     # ============================
     # 3) MDPI Normalization (기존 스케일러 로드)
@@ -450,9 +457,9 @@ def run_ppo_only(
             offset += random_offset
         
         if offset > 0:
-            df_subset = df_ppo.iloc[offset:].reset_index(drop=True)
+            df_subset = eval_df.iloc[offset:].reset_index(drop=True)
         else:
-            df_subset = df_ppo
+            df_subset = eval_df
         
         env = TradingEnv(
             df_subset, 

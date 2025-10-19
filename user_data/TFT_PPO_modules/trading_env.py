@@ -258,15 +258,15 @@ class TradingEnv(gym.Env):
         else:
             self.hold_streak = 0
         
-        # 4) 거래 인센티브 및 포지션 다양성 보너스
+        # 4) 거래 인센티브 및 포지션 다양성 보너스 - 강화
         trading_bonus = 0.0
         if position_changed:
-            trading_bonus = 0.0001  # 소량의 거래 인센티브
+            trading_bonus = 0.001  # 거래 인센티브 강화 (기존 0.0001에서 증가)
         
-        # 5) 연속 hold 페널티 (무거래 방지)
+        # 5) 연속 hold 페널티 (무거래 방지) - 강화
         hold_penalty = 0.0
-        if self.hold_streak > 20:  # 20스텝 이상 연속 hold
-            hold_penalty = 0.00005 * (self.hold_streak - 20)  # 점진적 페널티
+        if self.hold_streak > 10:  # 10스텝 이상 연속 hold (기존 20에서 단축)
+            hold_penalty = 0.0001 * (self.hold_streak - 10)  # 페널티 강화 (기존 0.00005에서 증가)
         
         # 6) 과매매 방지 (거래 빈도 제한) + 턴오버 페널티
         overtrading_penalty = 0.0
@@ -299,7 +299,10 @@ class TradingEnv(gym.Env):
         self.equity_peak = max(self.equity_peak, self.equity)
         dd_after = self._drawdown(self.equity_peak, self.equity)
 
-        # 7) 보상 계산 (수수료는 마이너스)
+        # 7) 거래 플래그는 '포지션 변경 여부'로! (먼저 정의)
+        trade_flag = int(position_changed)
+        
+        # 8) 보상 계산 (수수료는 마이너스)
         reward = (
             pnl_delta
             - fee_cost
@@ -310,6 +313,37 @@ class TradingEnv(gym.Env):
             - turnover_penalty
         )
 
+        # ✅ 극단적 액션 균등화: 모든 액션에 동일한 기본 보상
+        base_reward = 0.001  # 모든 액션에 동일한 기본 보상
+        
+        # ✅ 액션별 균등 보너스 (액션 다양성 강제)
+        action_bonus = {
+            0: 0.0005,  # hold
+            1: 0.0005,  # long  
+            2: 0.0005   # short
+        }[filtered_action]
+        
+        # ✅ 거래할 때마다 강력한 인센티브 추가
+        if trade_flag == 1:  # 거래 발생 시
+            reward += 0.01  # 거래 인센티브 극대화
+        
+        # ✅ 액션 다양성 보너스 (극단적 수정)
+        if not hasattr(self, 'action_history'):
+            self.action_history = []
+        self.action_history.append(filtered_action)
+        if len(self.action_history) > 50:
+            self.action_history.pop(0)
+        
+        # 최근 50스텝에서 액션 다양성 체크
+        if len(self.action_history) >= 20:
+            unique_actions = len(set(self.action_history))
+            if unique_actions >= 2:  # 2개 이상의 다른 액션 사용
+                diversity_bonus = 0.005 * unique_actions  # 다양성 보너스 극대화
+                reward += diversity_bonus
+        
+        # ✅ 기본 보상 + 액션 보너스 추가
+        reward += base_reward + action_bonus
+        
         # ✅ 순이익(pnl_delta - fee_cost) > 0 이면 최소 양수 보상 보장
         if (pnl_delta - fee_cost) > 0:
             if getattr(self, "sanity_mode", False):
@@ -319,12 +353,12 @@ class TradingEnv(gym.Env):
 
         reward = float(np.clip(reward, -0.05, 0.05))
         
-        # 8) 에피소드 보상 추적
+        # 9) 에피소드 보상 추적
         if not hasattr(self, 'episode_rewards'):
             self.episode_rewards = []
         self.episode_rewards.append(reward)
         
-        # 9) 에피소드 종료 시 Sharpe 보너스 + 거래 다양성 보너스
+        # 10) 에피소드 종료 시 Sharpe 보너스 + 거래 다양성 보너스
         done = self.current_step >= len(self.df) - 2
         if done and len(self.episode_rewards) > 10:
             r = np.asarray(self.episode_rewards, dtype=np.float64)
@@ -335,9 +369,6 @@ class TradingEnv(gym.Env):
             if self.position_changes > 5:  # 최소 5회 이상 거래
                 diversity_bonus = 0.005 * min(self.position_changes / 20, 1.0)  # 최대 0.005
                 reward += diversity_bonus
-        
-        # 8) 거래 플래그는 '포지션 변경 여부'로!
-        trade_flag = int(position_changed)
         self.prev_action = target_pos
 
         self.current_step += 1
